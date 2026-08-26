@@ -899,6 +899,156 @@ def test_fetch_full_text_reports_combined_error_when_both_tiers_fail(monkeypatch
     assert "Playwright not installed" in error
 
 
+class _FakePlaywrightBrowser:
+    def __init__(self, html):
+        self._html = html
+
+    def new_page(self, user_agent=None):
+        return SimpleNamespace(
+            goto=lambda url, wait_until=None, timeout=None: None,
+            wait_for_timeout=lambda ms: None,
+            content=lambda: self._html,
+        )
+
+    def close(self):
+        pass
+
+
+class _FakeChromium:
+    """launch_effects: a list consumed one per .launch() call — an Exception instance to raise,
+    or anything else to return a fake browser instead."""
+    def __init__(self, launch_effects, html="<html><body><p>Full article text long enough to "
+                                             "survive trafilatura's extraction heuristics here."
+                                             "</p></body></html>"):
+        self._effects = list(launch_effects)
+        self._html = html
+        self.launch_calls = 0
+
+    def launch(self, headless=True):
+        self.launch_calls += 1
+        effect = self._effects.pop(0)
+        if isinstance(effect, Exception):
+            raise effect
+        return _FakePlaywrightBrowser(self._html)
+
+
+class _FakeSyncPlaywrightCM:
+    def __init__(self, chromium):
+        self.chromium = chromium
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_try_playwright_lazily_installs_chromium_then_retries_launch(monkeypatch):
+    # Regression/feature test for Streamlit Community Cloud (and similar hosts with no
+    # build-hook to run a separate `playwright install chromium` step): `pip install playwright`
+    # gets you the Python package but not the browser binary, so the first real launch fails
+    # with Playwright's specific "Executable doesn't exist" error. _try_playwright should catch
+    # exactly that, install the browser once, and retry the launch — not treat it as a generic
+    # failure.
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    chromium = _FakeChromium([
+        RuntimeError("BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/..."),
+        "ok",  # second .launch() call succeeds
+    ])
+    import playwright.sync_api
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright",
+                         lambda: _FakeSyncPlaywrightCM(chromium))
+    monkeypatch.setattr(metacritic, "_ensure_playwright_chromium_installed", lambda: None)
+
+    text, error = metacritic._try_playwright("https://example.com/review", timeout=20)
+
+    assert error is None
+    assert text is not None and "Full article text" in text
+    assert chromium.launch_calls == 2  # failed once, retried once after the lazy install
+
+
+def test_try_playwright_reports_install_failure_without_retrying_launch(monkeypatch):
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    chromium = _FakeChromium([
+        RuntimeError("BrowserType.launch: Executable doesn't exist at /root/.cache/ms-playwright/..."),
+    ])
+    import playwright.sync_api
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright",
+                         lambda: _FakeSyncPlaywrightCM(chromium))
+    monkeypatch.setattr(metacritic, "_ensure_playwright_chromium_installed",
+                         lambda: "playwright install chromium failed: no space left on device")
+
+    text, error = metacritic._try_playwright("https://example.com/review", timeout=20)
+
+    assert text is None
+    assert error == "playwright install chromium failed: no space left on device"
+    assert chromium.launch_calls == 1  # no wasted retry once the install itself failed
+
+
+def test_try_playwright_does_not_intercept_unrelated_launch_errors(monkeypatch):
+    # Only the specific "browser not installed" failure should trigger the install-and-retry
+    # path — any other launch error (e.g. a real crash, an OOM kill) should surface normally,
+    # not be silently swallowed while the code waits on an install that was never the problem.
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    chromium = _FakeChromium([RuntimeError("Target page, context or browser has been closed")])
+    import playwright.sync_api
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright",
+                         lambda: _FakeSyncPlaywrightCM(chromium))
+    install_called = []
+    monkeypatch.setattr(metacritic, "_ensure_playwright_chromium_installed",
+                         lambda: install_called.append(True))
+
+    text, error = metacritic._try_playwright("https://example.com/review", timeout=20)
+
+    assert text is None
+    assert "Target page, context or browser has been closed" in error
+    assert install_called == []  # never attempted — this wasn't a missing-browser error
+    assert chromium.launch_calls == 1
+
+
+def test_ensure_playwright_chromium_installed_caches_result_across_calls(monkeypatch):
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    run_calls = []
+
+    def _fake_run(cmd, check=True, capture_output=True, text=True, timeout=300):
+        run_calls.append(cmd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(metacritic.subprocess, "run", _fake_run)
+
+    first = metacritic._ensure_playwright_chromium_installed()
+    second = metacritic._ensure_playwright_chromium_installed()
+
+    assert first is None
+    assert second is None
+    assert len(run_calls) == 1  # second call reused the cached success, no repeat subprocess
+
+
+def test_ensure_playwright_chromium_installed_reports_and_caches_failure(monkeypatch):
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    run_calls = []
+
+    def _fake_run(cmd, check=True, capture_output=True, text=True, timeout=300):
+        run_calls.append(cmd)
+        raise metacritic.subprocess.CalledProcessError(
+            returncode=1, cmd=cmd, output="", stderr="E: No space left on device\n"
+        )
+
+    monkeypatch.setattr(metacritic.subprocess, "run", _fake_run)
+
+    first = metacritic._ensure_playwright_chromium_installed()
+    second = metacritic._ensure_playwright_chromium_installed()
+
+    assert first is not None and "No space left on device" in first
+    assert second == first  # cached, not re-run
+    assert len(run_calls) == 1
+
+
 def test_build_sources_from_metacritic_maps_fields_and_reports_progress(monkeypatch):
     fake_items = [
         {"url": "https://a.example/review", "publicationName": "Outlet A", "score": 80,
