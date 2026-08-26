@@ -53,8 +53,19 @@ Deployment note: tier 2 needs Chromium available via Playwright (`playwright ins
 given deployment, tier 1 still works for every outlet it can handle on its own; tier 2 fetches
 simply report a clear per-review error instead of crashing the batch, exactly like any other
 fetch failure this app already tolerates (see extraction.fetch_review_url).
+
+On a host with no shell/build-hook access — Streamlit Community Cloud, notably — there's no way
+to run `playwright install chromium` as a separate step the way the Dockerfile and README's
+"Local run" do: `pip install -r requirements.txt` installs the `playwright` Python package but
+never the browser binary itself. _ensure_playwright_chromium_installed() below covers this by
+installing the browser lazily, on the first Playwright launch attempt that actually fails for
+that specific reason, rather than assuming it's already present. See README.md's "Streamlit
+Community Cloud" deployment section for the packages.txt this still requires (the OS-level
+libraries Chromium itself needs — no amount of Python-side installing substitutes for those).
 """
 import re
+import subprocess
+import sys
 import time
 from collections import Counter
 from typing import Callable, List, Optional, Tuple
@@ -222,6 +233,51 @@ def _try_requests(url: str, timeout: int) -> Tuple[Optional[str], Optional[str]]
         return None, str(e)
 
 
+_playwright_install_state = {"attempted": False, "error": None}
+
+
+def _ensure_playwright_chromium_installed() -> Optional[str]:
+    """
+    On a host with no shell/build-hook access — Streamlit Community Cloud, notably —
+    `pip install -r requirements.txt` installs the `playwright` Python package but never
+    downloads the actual Chromium binary; that's normally a separate `playwright install
+    chromium` step (Dockerfile, README's "Local run") that Community Cloud's build process has
+    nowhere to run. This installs it lazily instead, called from _try_playwright() only once its
+    first launch attempt has already failed with Playwright's specific "browser not installed"
+    error — so a deployment where the browser WAS pre-installed (Docker, a plain host that ran
+    the README's setup step) never pays this cost at all.
+
+    Runs the actual install subprocess at most once per process: if it fails (no disk space, no
+    network egress to Playwright's CDN, etc.), every subsequent Playwright fallback in this same
+    run reuses that one failure immediately rather than each retrying its own slow, doomed
+    install call and dragging out the whole batch behind it.
+
+    Returns None on success (or if already attempted and succeeded), or an error string on
+    failure — the caller folds this into the same per-review error reporting as any other
+    Playwright failure.
+    """
+    if _playwright_install_state["attempted"]:
+        return _playwright_install_state["error"]
+    _playwright_install_state["attempted"] = True
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True, capture_output=True, text=True, timeout=300,
+        )
+        return None
+    except subprocess.CalledProcessError as e:
+        # This can be a wall of download-progress output; the last few stderr lines are what
+        # actually explains the failure to a producer reading the review table's error column
+        # (e.g. a missing OS-level library — see README's "Streamlit Community Cloud" section
+        # for the packages.txt this doesn't substitute for).
+        tail = " | ".join((e.stderr or "").strip().splitlines()[-5:])
+        error = f"playwright install chromium failed: {tail or e}"
+    except Exception as e:  # noqa: BLE001 - covers subprocess timeout, missing python, etc.
+        error = f"playwright install chromium failed: {e}"
+    _playwright_install_state["error"] = error
+    return error
+
+
 def _try_playwright(url: str, timeout: int) -> Tuple[Optional[str], Optional[str]]:
     try:
         from playwright.sync_api import sync_playwright
@@ -230,7 +286,15 @@ def _try_playwright(url: str, timeout: int) -> Tuple[Optional[str], Optional[str
                        "pip install playwright && playwright install chromium")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as launch_err:
+                if "Executable doesn't exist" not in str(launch_err):
+                    raise
+                install_error = _ensure_playwright_chromium_installed()
+                if install_error:
+                    return None, install_error
+                browser = p.chromium.launch(headless=True)  # retry now that it's installed
             page = browser.new_page(user_agent=_HEADERS["User-Agent"])
             page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
             page.wait_for_timeout(1500)  # let client-side-rendered article bodies finish paint
