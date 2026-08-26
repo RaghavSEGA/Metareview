@@ -1,0 +1,6 @@
+# Non-secret Streamlit config — safe to commit (unlike secrets.toml). Raises the default
+# upload cap (200MB) so a zip of PDFs/HTML for a large review batch isn't rejected client-side.
+# If this app sits behind a reverse proxy or load balancer, that layer may enforce its own
+# request-body-size limit independently of this setting — see README's Deploying section.
+[server]
+maxUploadSize = 1024
