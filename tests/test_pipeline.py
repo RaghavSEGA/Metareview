@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app import metacritic
 from app.classify import (
     _normalize_classifications, _normalize_review_language, _normalize_stated_score,
-    classify_review, classify_reviews_for_categories, detect_emergent_categories,
+    classify_review, classify_reviews, classify_reviews_for_categories,
+    detect_emergent_categories,
 )
 from app.extraction import extract_score_from_text, extract_text_from_html
 from app.matrix import (
@@ -326,8 +327,11 @@ def test_classify_reviews_for_categories_merges_results_and_reports_progress():
     client = _QueuedClient(responses, tool_name="submit_classification")
 
     progress_calls = []
+    # max_workers=1 keeps this fully sequential/deterministic: _QueuedClient pops a fixed-order
+    # response queue and this test asserts an exact call/progress order, both assumptions that
+    # only hold with a single worker — real callers leave max_workers at its concurrent default.
     data, failed = classify_reviews_for_categories(
-        client, sources, ["Theurgy"], model="test-model",
+        client, sources, ["Theurgy"], model="test-model", max_workers=1,
         progress_cb=lambda done, total: progress_calls.append((done, total)),
     )
 
@@ -359,11 +363,69 @@ def test_classify_reviews_for_categories_isolates_failures_per_review():
             return SimpleNamespace(content=[block])
 
     client = SimpleNamespace(messages=_FlakyMessages())
-    data, failed = classify_reviews_for_categories(client, sources, ["Theurgy"], model="test-model")
+    # max_workers=1: _FlakyMessages fails unconditionally on call #1 (whichever review triggers
+    # it) — only deterministic ("Outlet A" specifically fails) with a single, sequential worker.
+    data, failed = classify_reviews_for_categories(
+        client, sources, ["Theurgy"], model="test-model", max_workers=1
+    )
 
     assert failed == [("Outlet A", "simulated API error")]
     assert "a" not in data.get("Theurgy", {})
     assert data["Theurgy"]["b"] == (1, "loved it")
+
+
+class _ContentRoutedMessages:
+    """Routes to a canned response (or raises a canned exception) by matching a substring in the
+    outgoing review text, rather than by call order — necessary for testing classify_reviews()
+    since it dispatches calls concurrently, so which review's API call actually happens first
+    isn't guaranteed/deterministic the way it is for the sequential _QueuedMessages fake above."""
+    def __init__(self, routes):
+        self._routes = routes  # [(substring, response_dict_or_exception), ...]
+
+    def create(self, **kwargs):
+        text = kwargs["messages"][0]["content"]
+        for substring, response in self._routes:
+            if substring in text:
+                if isinstance(response, Exception):
+                    raise response
+                block = SimpleNamespace(type="tool_use", name="submit_classification", input=response)
+                return SimpleNamespace(content=[block])
+        raise AssertionError(f"no route matched request text: {text!r}")
+
+
+def test_classify_reviews_preserves_source_order_and_isolates_errors():
+    # Confirms two things that only matter once classification runs concurrently: (1) the
+    # returned list stays in the SAME ORDER as `sources` regardless of which review's API call
+    # actually completes first (downstream code zips results back to sources by position), and
+    # (2) one review's classification failure is isolated to that review's slot rather than
+    # raising and losing the rest of the batch.
+    sources = [
+        SimpleNamespace(key="a", outlet="Outlet A", text="review a text mentions combat"),
+        SimpleNamespace(key="b", outlet="Outlet B", text="review b text is broken"),
+        SimpleNamespace(key="c", outlet="Outlet C", text="review c text mentions story"),
+    ]
+    routes = [
+        ("review a text", {
+            "classifications": [{"category": "Combat", "value": 1, "quote": "great combat"}],
+            "candidate_emergent_topics": [], "review_language": "English",
+            "stated_score": None, "stated_score_raw": None,
+        }),
+        ("review b text", RuntimeError("simulated failure")),
+        ("review c text", {
+            "classifications": [{"category": "Story", "value": -1, "quote": "weak story"}],
+            "candidate_emergent_topics": [], "review_language": "English",
+            "stated_score": None, "stated_score_raw": None,
+        }),
+    ]
+    client = SimpleNamespace(messages=_ContentRoutedMessages(routes))
+
+    results = classify_reviews(client, sources, ["Combat", "Story"], model="test-model",
+                                max_workers=3)
+
+    assert len(results) == 3
+    assert results[0]["classifications"] == [{"category": "Combat", "value": 1, "quote": "great combat"}]
+    assert results[1] == {"error": "simulated failure"}
+    assert results[2]["classifications"] == [{"category": "Story", "value": -1, "quote": "weak story"}]
 
 
 def _sample_reviews_and_data():
@@ -1061,8 +1123,10 @@ def test_build_sources_from_metacritic_maps_fields_and_reports_progress(monkeypa
                          lambda url, timeout=20: ("Full article text.", "requests", None))
 
     progress_calls = []
+    # max_workers=1: this test asserts an exact progress-call order, which only holds
+    # deterministically with a single worker — real callers leave max_workers at its default.
     sources = build_sources_from_metacritic(
-        "some-slug",
+        "some-slug", max_workers=1,
         progress_cb=lambda done, total, outlet: progress_calls.append((done, total, outlet)),
     )
 
@@ -1180,8 +1244,9 @@ def test_build_sources_from_metacritic_all_platforms_uses_consolidated_list(monk
                          lambda url, timeout=20: ("Full article text.", "requests", None))
 
     progress_calls = []
+    # max_workers=1: same determinism reasoning as the single-platform test above.
     sources = build_sources_from_metacritic_all_platforms(
-        "some-slug",
+        "some-slug", max_workers=1,
         progress_cb=lambda done, total, outlet: progress_calls.append((done, total, outlet)),
     )
 
@@ -1191,6 +1256,63 @@ def test_build_sources_from_metacritic_all_platforms_uses_consolidated_list(monk
     assert progress_calls == [
         (1, 2, "Outlet A (PlayStation 5)"), (2, 2, "Outlet A (PC)"),
     ]
+
+
+def test_sources_from_items_preserves_order_under_concurrency(monkeypatch):
+    # Simulates reviews finishing in the REVERSE of their submission order (item 0 is the
+    # slowest) to confirm the returned list still comes back ordered by original input position,
+    # not completion order. This matters because _make_key(i, outlet) bakes the ORIGINAL index
+    # into each review's key, and downstream classification/matrix code depends on that staying
+    # stable regardless of which fetch actually finished first.
+    import time as time_module
+
+    items = [
+        {"url": "https://a.example/review", "publicationName": "Outlet A"},
+        {"url": "https://b.example/review", "publicationName": "Outlet B"},
+        {"url": "https://c.example/review", "publicationName": "Outlet C"},
+    ]
+    delays = {"https://a.example/review": 0.06, "https://b.example/review": 0.03,
+              "https://c.example/review": 0.0}
+
+    def _fake_fetch_full_text(url, timeout=20):
+        time_module.sleep(delays[url])
+        return f"text for {url}", "requests", None
+
+    monkeypatch.setattr(metacritic, "fetch_full_text", _fake_fetch_full_text)
+
+    sources = metacritic._sources_from_items(items, max_workers=3)
+
+    assert [s.outlet for s in sources] == ["Outlet A", "Outlet B", "Outlet C"]
+    assert [s.key for s in sources] == ["mc_0_outlet-a", "mc_1_outlet-b", "mc_2_outlet-c"]
+
+
+def test_ensure_playwright_chromium_installed_is_thread_safe_under_concurrent_calls(monkeypatch):
+    # Once _sources_from_items() fetches multiple reviews concurrently, more than one worker
+    # thread can reach this function's very first call at nearly the same instant — without a
+    # lock, each could see attempted=False and independently kick off its own redundant (slow)
+    # subprocess.run() install. Confirms _playwright_install_lock serializes them down to one.
+    import threading as threading_module
+    import time as time_module
+
+    monkeypatch.setattr(metacritic, "_playwright_install_state",
+                         {"attempted": False, "error": None})
+    run_calls = []
+
+    def _fake_run(cmd, check=True, capture_output=True, text=True, timeout=300):
+        time_module.sleep(0.05)  # widen the race window so a missing lock would actually show up
+        run_calls.append(cmd)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(metacritic.subprocess, "run", _fake_run)
+
+    threads = [threading_module.Thread(target=metacritic._ensure_playwright_chromium_installed)
+               for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(run_calls) == 1  # serialized to exactly one real install attempt
 
 
 if __name__ == "__main__":
