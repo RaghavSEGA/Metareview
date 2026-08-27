@@ -3,14 +3,37 @@ Builds the metareview matrix xlsx — same structure as Sega's existing Metarevi
 template (validated in the Persona 3: Reload POC). Pure function of (reviews, categories,
 data) -> openpyxl Workbook, so it's easy to unit test without Streamlit or the network.
 """
+from io import BytesIO
+
 import openpyxl
-from openpyxl.chart import BarChart, Reference
 from openpyxl.comments import Comment
+from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .charts import render_opinion_graph_png
+
 FONT = "Arial"
 FIRST_REVIEW_COL = 6  # column F, matching the original template layout
+
+_COMMENT_WIDTH = 260  # wide enough that _COMMENT_CHARS_PER_LINE stays a fair estimate
+_COMMENT_CHARS_PER_LINE = 34  # rough wrap width at that box's default comment font
+_COMMENT_MIN_HEIGHT, _COMMENT_MAX_HEIGHT = 90, 400
+
+
+def _comment_box_size(text: str):
+    """
+    openpyxl's Comment defaults to a fixed 144x79px box (openpyxl.comments.Comment's own
+    defaults) — comfortably fits a short pull-quote but clips anything longer, so a producer
+    only sees the box's first line or two unless they manually drag it bigger in Excel. The
+    actual comment TEXT was never truncated (Comment.content always held the full string) — it
+    just wasn't visible without resizing, which reads the same as truncation to anyone who
+    didn't think to try. Sizing the box's height to the quote's real length up front means the
+    full quote is visible on open, capped so one enormous quote can't cover half the sheet.
+    """
+    lines_needed = max(1, -(-len(text) // _COMMENT_CHARS_PER_LINE))  # ceil division
+    height = min(_COMMENT_MAX_HEIGHT, max(_COMMENT_MIN_HEIGHT, lines_needed * 16 + 20))
+    return _COMMENT_WIDTH, height
 
 
 def build_matrix_workbook(game_title: str, reviews, categories, data) -> openpyxl.Workbook:
@@ -84,20 +107,21 @@ def build_matrix_workbook(game_title: str, reviews, categories, data) -> openpyx
             if entry:
                 val, quote = entry
                 cell = ws.cell(row=row, column=col, value=val)
-                cell.comment = Comment(quote, "AI Metareview")
+                width, height = _comment_box_size(quote)
+                cell.comment = Comment(quote, "AI Metareview", width=width, height=height)
                 cell.fill = pos_fill if val == 1 else (neg_fill if val == -1 else neu_fill)
         row += 1
 
     last_cat_row = row - 1
-    chart = BarChart()
-    chart.type = "bar"
-    chart.title = f"{game_title} — Opinion Graph (weighted)"
-    chart.height, chart.width = 16, 24
-    chart.add_data(Reference(ws, min_col=1, min_row=7, max_row=last_cat_row), titles_from_data=False)
-    chart.set_categories(Reference(ws, min_col=5, min_row=7, max_row=last_cat_row))
-    chart.legend = None
-    chart.series[0].graphicalProperties.solidFill = "4472C4"
-    ws.add_chart(chart, f"E{last_cat_row + 3}")
+    # A rendered picture, not a native openpyxl BarChart — see charts.py's module docstring for
+    # why: a native chart object here was confirmed to render with blank category-axis labels
+    # (an empty, rotated placeholder box per label) in non-Excel viewers, even though the same
+    # chart displays fine in Excel desktop. A picture looks identical everywhere.
+    scores = compute_weighted_scores(reviews, categories, data)
+    opinion_graph_png = render_opinion_graph_png(game_title, scores)
+    if opinion_graph_png:
+        img = XLImage(BytesIO(opinion_graph_png))
+        ws.add_image(img, f"E{last_cat_row + 3}")
 
     ws.column_dimensions["A"].width = 24
     ws.column_dimensions["E"].width = 22
