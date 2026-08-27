@@ -12,10 +12,13 @@ per-run data):
   - Executive Summary is 3-5 sentences: overall reception, then the 2-3 strongest points, then
     the 1-2 weakest, in that order.
   - Category call-outs use a bracketed severity label in the heading (see
-    matrix.suggest_sentiment_label) and are NOT written for every category that clears the
-    matrix threshold — only the handful that are most narratively significant. Everything else
-    still lives in the matrix/graph without prose.
-  - Each call-out is a short synthesis paragraph followed by 2-5 directly attributed quotes.
+    matrix.suggest_sentiment_label) and are written for EVERY category in the matrix, not just a
+    hand-picked "most significant" subset — a category with only a handful of mentions still
+    gets at least a short paragraph (with a caveat that the sample is thin), rather than being
+    silently left out of the report entirely. Depth scales with how much real data backs a
+    category; coverage doesn't.
+  - Each call-out is a short synthesis paragraph followed by 2-5 directly attributed quotes
+    (fewer, or none, for a thin category with little to quote).
   - A producer may append a one-line caveat to a label when the sample behind it is thin (the
     "Richard's Note" pattern) — the model should do the same rather than presenting a
     thin-sample label with false confidence.
@@ -35,46 +38,60 @@ What's genre-VARIANT (comes from the actual run data, not the prompt):
 """
 from typing import List, Optional
 
-_CATEGORY_CALLOUTS_PROPERTY = {
-    "type": "array",
-    "description": "Full write-ups for the most narratively significant categories "
-                    "only — not every category in the matrix. Roughly 6-14 depending "
-                    "on how much genuine variation there is.",
-    "items": {
-        "type": "object",
-        "properties": {
-            "category": {"type": "string"},
-            "label": {
-                "type": "string",
-                "description": "The severity label for the heading, e.g. 'Widely "
-                               "Praised' or 'Extremely Controversial'. Start from the "
-                               "suggested_label given to you; override with your own "
-                               "if the data clearly warrants it.",
-            },
-            "label_caveat": {
-                "type": "string",
-                "description": "One-line caveat if this category's sample is thin "
-                               "enough that the label deserves a grain of salt "
-                               "(the 'Richard's Note' pattern) — empty string if not needed.",
-            },
-            "synthesis": {"type": "string", "description": "1-3 sentence synthesis paragraph."},
-            "quotes": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "outlet": {"type": "string"},
-                    },
-                    "required": ["text", "outlet"],
+def _build_category_callouts_property(categories: List[str]) -> dict:
+    """
+    `category` is constrained to an enum of the exact given category names — same defensive
+    reasoning as classify.py's _build_classify_tool: without this, nothing stops the model from
+    paraphrasing a category name back slightly differently, which would make the completeness
+    check in draft_narrative() below (matching returned categories against the given set) treat
+    a real write-up as "missing" and inject a redundant fallback paragraph next to it.
+    """
+    return {
+        "type": "array",
+        "description": (
+            "One write-up per category — EVERY category listed below, no exceptions, even one "
+            "mentioned by only a handful of reviews. A well-supported category gets a fuller "
+            "synthesis (2-4 sentences, several quotes); a thin one can be as short as a single "
+            "sentence with 0-2 quotes and a label_caveat noting the small sample. Completeness "
+            "matters here, not depth — never drop a category from this array."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": categories},
+                "label": {
+                    "type": "string",
+                    "description": "The severity label for the heading, e.g. 'Widely "
+                                   "Praised' or 'Extremely Controversial'. Start from the "
+                                   "suggested_label given to you; override with your own "
+                                   "if the data clearly warrants it.",
                 },
-                "description": "2-5 directly attributed quotes, pulled verbatim from "
-                               "the quotes you were given — never invent a quote.",
+                "label_caveat": {
+                    "type": "string",
+                    "description": "One-line caveat if this category's sample is thin "
+                                   "enough that the label deserves a grain of salt "
+                                   "(the 'Richard's Note' pattern) — empty string if not needed.",
+                },
+                "synthesis": {"type": "string", "description": "1-3 sentence synthesis paragraph "
+                                                                 "(1 sentence is fine for a thin category)."},
+                "quotes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "outlet": {"type": "string"},
+                        },
+                        "required": ["text", "outlet"],
+                    },
+                    "description": "2-5 directly attributed quotes pulled verbatim from the "
+                                   "quotes you were given — never invent a quote. Fewer (down "
+                                   "to 0) is fine for a category with little to quote from.",
+                },
             },
+            "required": ["category", "label", "synthesis", "quotes"],
         },
-        "required": ["category", "label", "synthesis", "quotes"],
-    },
-}
+    }
 
 _FAN_REACTION_PROPERTY = {
     "type": "array",
@@ -101,8 +118,13 @@ _RECOMMENDATIONS_PROPERTY = {
 }
 
 
-def _build_narrative_tool(include_recommendations: bool, include_fan_reaction: bool = False) -> dict:
+def _build_narrative_tool(categories: List[str], include_recommendations: bool,
+                           include_fan_reaction: bool = False) -> dict:
     """
+    categories: every category name that must get a call-out (see
+    _build_category_callouts_property) — pass list(category_scores.keys()) from the run's full
+    matrix, not a pre-filtered subset.
+
     include_recommendations=False omits the "recommendations" property from the schema
     entirely, rather than asking the model to produce one and then discarding it — a producer
     who wants PD Recommendations left out of a given run (e.g. it's handled elsewhere in their
@@ -126,7 +148,7 @@ def _build_narrative_tool(include_recommendations: bool, include_fan_reaction: b
                             "themes (things that show up across multiple categories), in the "
                             "style of a 'Press Reactions' section intro.",
         },
-        "category_callouts": _CATEGORY_CALLOUTS_PROPERTY,
+        "category_callouts": _build_category_callouts_property(categories),
     }
     required = ["executive_summary", "press_reactions_synthesis", "category_callouts"]
     if include_recommendations:
@@ -168,9 +190,11 @@ what the notes actually say."""
         if include_fan_reaction else ""
     )
     reportable_requirement = (
-        "category_callouts and recommendations must NOT be empty arrays"
+        "category_callouts must have exactly one entry per category given to you (see the "
+        "category list in the schema's enum) and recommendations must NOT be an empty array"
         if include_recommendations else
-        "category_callouts must NOT be an empty array"
+        "category_callouts must have exactly one entry per category given to you (see the "
+        "category list in the schema's enum)"
     )
     return f"""You are drafting the narrative sections of a Sega metareview report. \
 A metareview aggregates press-critic sentiment into a category-by-category matrix, then a report \
@@ -190,11 +214,15 @@ categories — e.g. "reviewers praised the breadth of content across every mode,
 X was often really about Y." This is not a list of every category; it's the connective tissue \
 between them.
 
-Category call-outs: pick roughly 6-14 of the most narratively significant categories — NOT every \
-category that appears in the matrix. A category that barely cleared the reporting threshold with \
-a handful of throwaway mentions does not need its own write-up; it can just live in the matrix. \
-Prioritize categories that are either extreme (near-unanimous praise or genuine polarization) or \
-that a producer would clearly want to discuss in a meeting.
+Category call-outs: write ONE entry for EVERY category in the matrix — do not skip any, and do \
+not limit yourself to a "most significant" subset. Depth should scale with how much real data \
+backs a category, not whether it makes the cut at all:
+- A well-supported category (comfortably above the reporting threshold, several quotes \
+available) gets the full treatment: 2-4 sentence synthesis, 2-5 quotes.
+- A thin category (barely mentioned, few or no quotes to draw on) still gets its own entry — as \
+short as one sentence, with 0-2 quotes if that's all there is, plus a label_caveat noting the \
+small sample. A short, honest entry beats no entry at all; a producer scanning the report should \
+never have to wonder whether a category was overlooked versus genuinely silent.
 
 For each call-out:
 - Use the given suggested_label for the heading (e.g. "Widely Praised", "Extremely \
@@ -204,18 +232,19 @@ fixed vocabulary: Universally/Widely/Generally Praised or Panned, Somewhat Contr
 - If the category's total mention count is small relative to the review pool (a thin sample), \
 add a one-line label_caveat noting that — do not present a low-confidence label with false \
 confidence. This mirrors a real producer's own practice of flagging exactly this.
-- Write a short (1-3 sentence) synthesis, then attach 2-5 quotes PULLED VERBATIM from the quote \
-pool you were given, each with its outlet attribution. Never invent or paraphrase a quote as if \
-it were verbatim — if you want to paraphrase, do it in the synthesis text, not inside a quote field.{recommendations_section}{fan_reaction_section}
+- Write a short synthesis (1-3 sentences; 1 is fine for a thin category), then attach up to 5 \
+quotes PULLED VERBATIM from the quote pool you were given, each with its outlet attribution — \
+0 quotes is fine if the category genuinely has little or nothing to draw on. Never invent or \
+paraphrase a quote as if it were verbatim — if you want to paraphrase, do it in the synthesis \
+text, not inside a quote field.{recommendations_section}{fan_reaction_section}
 
 Do not use marketing language, exclamation points, or hedge everything into mush. State \
 conclusions plainly. This document's reader already trusts the underlying data (the matrix) — \
 your job is to make it readable, not to sell it.
 
-You are given category stats for every category that cleared the reporting threshold. If one or \
-more of those categories exists, {reportable_requirement} \
-— pick the strongest handful and write them, even briefly, rather than returning nothing. If you \
-are running low on space, favor writing fewer, shorter call-outs over writing zero."""
+You are given category stats for every category in this run's matrix, thin ones included — {reportable_requirement}. \
+If you are running low on output space, favor shorter call-outs across ALL categories over full-length \
+call-outs for only some — completeness matters more here than depth on any single one."""
 
 
 def build_narrative_user_prompt(game_title: str, platforms: str, avg_score: float,
@@ -234,20 +263,23 @@ def build_narrative_user_prompt(game_title: str, platforms: str, avg_score: floa
         f"Reviews: {review_count}, average score {avg_score_text}", "",
         "Category stats (weighted = (positive-negative)/review_count):",
     ]
+    # Every category goes in, low-mention ones included — the model gets a call-out per
+    # category regardless (see _build_system_prompt), so it needs stats for all of them, not
+    # just ones that clear the reporting threshold. low_mention flags the ones that don't, so
+    # the model knows which categories need a label_caveat and a shorter write-up.
     for cat, stats in category_scores.items():
-        if not stats["meets_threshold"]:
-            continue
+        low_mention_flag = " low_mention=true" if not stats["meets_threshold"] else ""
         lines.append(
             f"- {cat}: weighted={stats['weighted']:.2f}, positive={stats['positive']}, "
             f"mixed={stats['mixed']}, negative={stats['negative']}, "
             f"mention_rate={stats['mention_rate']:.0%}, "
-            f"suggested_label={stats['suggested_label']}"
+            f"suggested_label={stats['suggested_label']}{low_mention_flag}"
         )
 
     lines.append("")
     lines.append("Quote pool (category | outlet | value | quote):")
     for cat, entries in data.items():
-        if cat not in category_scores or not category_scores[cat]["meets_threshold"]:
+        if cat not in category_scores:
             continue
         for key, (value, quote) in entries.items():
             outlet = outlet_by_key.get(key, key)
@@ -296,11 +328,12 @@ def draft_narrative(client, game_title: str, platforms: str, avg_score: float,
     from .classify import DEFAULT_MODEL
     model = model or DEFAULT_MODEL
     include_fan_reaction = bool(fan_reaction_notes and fan_reaction_notes.strip())
+    all_categories = list(category_scores.keys())
     user_prompt = build_narrative_user_prompt(
         game_title, platforms, avg_score, review_count, category_scores, data, reviews,
         fan_reaction_notes=fan_reaction_notes,
     )
-    tool = _build_narrative_tool(include_recommendations, include_fan_reaction)
+    tool = _build_narrative_tool(all_categories, include_recommendations, include_fan_reaction)
     system_prompt = _build_system_prompt(include_recommendations, include_fan_reaction)
 
     def _call(tokens: int) -> dict:
@@ -319,14 +352,44 @@ def draft_narrative(client, game_title: str, platforms: str, avg_score: float,
 
     result = _call(max_tokens)
 
-    reportable = sum(1 for s in category_scores.values() if s.get("meets_threshold"))
-    if reportable and not result.get("category_callouts"):
-        # category_callouts came back empty despite there being reportable category data — the
-        # failure mode this was built to catch. (Recommendations is deliberately NOT part of
-        # this check: with include_recommendations=False it's always absent by design, and that
-        # must not look like the same failure and trigger a wasted retry.) One retry at double
-        # the budget rather than silently shipping a report with an empty "Good and the Bad".
+    def _missing_categories(res: dict) -> set:
+        returned = {co.get("category") for co in res.get("category_callouts", [])
+                    if isinstance(co, dict)}
+        return set(all_categories) - returned
+
+    missing = _missing_categories(result)
+    if all_categories and missing:
+        # Every category is required to get a callout now (not just a "reportable" subset), so
+        # ANY gap — not just a totally empty array — is the incomplete-output failure mode this
+        # retry exists to catch (same root cause as before: the model runs low on output budget
+        # partway through a long list of categories and stops). One retry at double the budget.
         result = _call(max_tokens * 2)
+        missing = _missing_categories(result)
+
+    if missing:
+        # Still short after the retry — inject a minimal, honest fallback entry for whatever's
+        # left rather than silently shipping a report that skips a category. This guarantees
+        # every category the run actually scored gets SOME paragraph in the final report,
+        # regardless of what the model did.
+        callouts = result.setdefault("category_callouts", [])
+        for cat in all_categories:
+            if cat not in missing:
+                continue
+            stats = category_scores[cat]
+            low_mention = not stats.get("meets_threshold")
+            callouts.append({
+                "category": cat,
+                "label": stats.get("suggested_label", "Not enough data"),
+                "label_caveat": (
+                    "Based on a very small number of mentions — treat this label with caution."
+                    if low_mention else ""
+                ),
+                "synthesis": (
+                    f"Mentioned by {stats.get('mention_rate', 0):.0%} of reviews — not enough "
+                    "discussion to synthesize further this run."
+                ),
+                "quotes": [],
+            })
 
     if not include_recommendations:
         result["recommendations"] = []  # enforce regardless of what the model actually returned
