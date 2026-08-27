@@ -43,9 +43,20 @@ secrets, the sidebar shows "No LLM credentials configured" and the run button is
 
 ```bash
 pip install -r requirements.txt
+playwright install chromium   # once — Metacritic full-review-text fallback, app/metacritic.py
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill in at least one LLM credential set
 streamlit run app/streamlit_app.py
 ```
+
+The `playwright install chromium` step downloads a browser binary (~150-300MB) into a local
+cache the first time; you don't need Docker for this — it works the same on a plain venv on
+your laptop, a bare VM, or a systemd service. On Linux, if it later fails at runtime with
+missing shared-library errors, re-run as `playwright install --with-deps chromium` instead
+(needs sudo, since it apt-installs the OS packages Chromium needs — this is what the Dockerfile
+does automatically). macOS and Windows don't normally need `--with-deps`. If you'd rather skip
+Playwright entirely, it's optional: leave it uninstalled and everything else works as-is — the
+Metacritic tab's full-text fetch just falls back to reporting a clear error for any outlet that
+needed a browser to render, instead of crashing.
 
 ## Tests
 
@@ -66,10 +77,45 @@ docker build -t metareview-tool .
 docker run -p 8501:8501 -v $(pwd)/.streamlit/secrets.toml:/app/.streamlit/secrets.toml metareview-tool
 ```
 
+Docker isn't required, though — it's just a convenient way to ship the Chromium install alongside
+the app. Running it directly on a host works the same way as the Local run section above (`pip
+install -r requirements.txt`, `playwright install chromium`, `streamlit run app/streamlit_app.py
+--server.port=8501 --server.address=0.0.0.0`), kept alive with whatever process manager Sega
+already uses for long-running services (systemd, pm2, supervisord, etc.) instead of a container.
+
 Put this behind whatever Sega already uses to expose internal tools (a reverse proxy, an
 internal load balancer, a VPN-only network) — **do not expose this directly to the public
 internet** even with the OTP gate in place. OTP-over-email is a reasonable stopgap for a small
 trusted pilot, not a substitute for being on internal infrastructure.
+
+### Streamlit Community Cloud
+
+Community Cloud (the free `share.streamlit.io` hosting that deploys straight from a GitHub
+repo) works for this app, but it gives you no shell/sudo access, so neither the Dockerfile nor
+the Local run section's `playwright install --with-deps chromium` step can run there directly.
+Two things this repo ships to cover that gap:
+
+- **`packages.txt`** (repo root) — Community Cloud auto-detects this file and apt-installs
+  whatever's listed, one package per line; it's the OS-level libraries Chromium itself needs to
+  run, equivalent to the Dockerfile's `--with-deps` flag. Already included here — no edits
+  needed unless Chromium's own dependencies change in a future Playwright release.
+- **The Chromium *browser binary*** is a separate problem `packages.txt` doesn't solve —
+  `pip install -r requirements.txt` installs the `playwright` Python package but never
+  downloads the actual browser, and Community Cloud's build step has no hook to run a follow-up
+  `playwright install chromium` command the way Docker's `RUN` step does. `app/metacritic.py`
+  handles this by installing it lazily instead: the first time the Playwright fallback tier is
+  actually needed, it installs the browser on the spot (see
+  `_ensure_playwright_chromium_installed()`), then proceeds. That first fallback fetch in a
+  freshly-started app will be slower (a one-time ~150–300MB download) than every one after it;
+  this repeats after every cold start / redeploy, since Community Cloud's filesystem doesn't
+  persist across those — that's expected, not a bug. If the install itself fails (e.g. no disk
+  space), it's reported as that review's fetch error same as any other Playwright failure,
+  rather than crashing the run.
+
+If you hit an apt dependency error on `packages.txt` after a Streamlit-side base-image update,
+or a Playwright error about unmet dependencies after upgrading `playwright` in
+`requirements.txt`, try pinning to a slightly older `playwright` version first — Community
+Cloud's Debian image has occasionally lagged what the newest Playwright releases expect.
 
 ### Upload size limit
 
@@ -82,6 +128,18 @@ uploads still fail above roughly 200MB after this change, check that layer too (
 `client_max_body_size`). There's no hard ceiling on the app side beyond available memory: the
 whole zip is read into memory at once, so very large batches (multiple GB) need a host with the
 RAM to match.
+
+## Performance: parallel requests
+
+Metacritic full-text fetching and both classification passes (main categories, then the
+emergent-category follow-up pass) run concurrently in bounded batches rather than strictly one
+review at a time — the sidebar's "Parallel requests" slider (default 5, range 1-10) controls how
+many run at once. Set it to 1 to go back to fully sequential/one-at-a-time behavior. Turning it
+up speeds up a large batch, but two tradeoffs are worth knowing: a high value can trip the
+Anthropic/Bedrock API's per-minute rate limit on a big run, and on the Metacritic tab specifically
+it can spike memory if several reviews fall back to a concurrent headless-browser (Playwright)
+render at once — worth keeping lower on a memory-constrained host like Streamlit Community
+Cloud's free tier.
 
 ## Auth: OTP now, SSO later
 
