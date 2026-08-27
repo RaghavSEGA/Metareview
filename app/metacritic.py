@@ -66,14 +66,22 @@ libraries Chromium itself needs — no amount of Python-side installing substitu
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
 from .extraction import ReviewSource, extract_text_from_html
+
+# Bounded concurrency for _sources_from_items() below — see its docstring. Not unbounded ("one
+# thread per review") to avoid bursty, bot-detection-triggering request volume against outlet
+# servers, and to avoid a memory spike from launching several headless Chromium instances at
+# once on memory-constrained hosts (e.g. Streamlit Community Cloud's free tier).
+_DEFAULT_FULL_TEXT_WORKERS = 5
 
 _LIST_API_URL = "https://backend.metacritic.com/reviews/metacritic/critic/games/{slug}/web"
 _LIST_API_URL_FOR_PLATFORM = (
@@ -234,6 +242,12 @@ def _try_requests(url: str, timeout: int) -> Tuple[Optional[str], Optional[str]]
 
 
 _playwright_install_state = {"attempted": False, "error": None}
+# Guards _playwright_install_state above. Necessary now that _sources_from_items() fetches
+# multiple reviews concurrently (see below): without this, two worker threads could both see
+# attempted=False at nearly the same instant and each kick off its own redundant, slow
+# subprocess.run() install — this serializes them so only the first caller actually installs and
+# every other concurrent caller blocks, then reuses that one result.
+_playwright_install_lock = threading.Lock()
 
 
 def _ensure_playwright_chromium_installed() -> Optional[str]:
@@ -250,32 +264,34 @@ def _ensure_playwright_chromium_installed() -> Optional[str]:
     Runs the actual install subprocess at most once per process: if it fails (no disk space, no
     network egress to Playwright's CDN, etc.), every subsequent Playwright fallback in this same
     run reuses that one failure immediately rather than each retrying its own slow, doomed
-    install call and dragging out the whole batch behind it.
+    install call and dragging out the whole batch behind it. Thread-safe via
+    _playwright_install_lock — see its comment above.
 
     Returns None on success (or if already attempted and succeeded), or an error string on
     failure — the caller folds this into the same per-review error reporting as any other
     Playwright failure.
     """
-    if _playwright_install_state["attempted"]:
-        return _playwright_install_state["error"]
-    _playwright_install_state["attempted"] = True
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True, capture_output=True, text=True, timeout=300,
-        )
-        return None
-    except subprocess.CalledProcessError as e:
-        # This can be a wall of download-progress output; the last few stderr lines are what
-        # actually explains the failure to a producer reading the review table's error column
-        # (e.g. a missing OS-level library — see README's "Streamlit Community Cloud" section
-        # for the packages.txt this doesn't substitute for).
-        tail = " | ".join((e.stderr or "").strip().splitlines()[-5:])
-        error = f"playwright install chromium failed: {tail or e}"
-    except Exception as e:  # noqa: BLE001 - covers subprocess timeout, missing python, etc.
-        error = f"playwright install chromium failed: {e}"
-    _playwright_install_state["error"] = error
-    return error
+    with _playwright_install_lock:
+        if _playwright_install_state["attempted"]:
+            return _playwright_install_state["error"]
+        _playwright_install_state["attempted"] = True
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True, capture_output=True, text=True, timeout=300,
+            )
+            return None
+        except subprocess.CalledProcessError as e:
+            # This can be a wall of download-progress output; the last few stderr lines are what
+            # actually explains the failure to a producer reading the review table's error
+            # column (e.g. a missing OS-level library — see README's "Streamlit Community
+            # Cloud" section for the packages.txt this doesn't substitute for).
+            tail = " | ".join((e.stderr or "").strip().splitlines()[-5:])
+            error = f"playwright install chromium failed: {tail or e}"
+        except Exception as e:  # noqa: BLE001 - covers subprocess timeout, missing python, etc.
+            error = f"playwright install chromium failed: {e}"
+        _playwright_install_state["error"] = error
+        return error
 
 
 def _try_playwright(url: str, timeout: int) -> Tuple[Optional[str], Optional[str]]:
@@ -333,6 +349,7 @@ def _make_key(index: int, outlet: str) -> str:
 
 def _sources_from_items(
     items: List[dict], progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    max_workers: int = _DEFAULT_FULL_TEXT_WORKERS,
 ) -> List[ReviewSource]:
     """
     Shared by both build_sources_from_metacritic() and its all-platforms sibling: given a list
@@ -341,13 +358,25 @@ def _sources_from_items(
     and paste-URL paths already produce, so this plugs into the existing review table /
     classification pipeline unchanged.
 
-    progress_cb(done, total, outlet), if given, is called after each review is fetched — used
-    by the Streamlit UI to drive a progress bar, since the full-text fetch (especially any
-    Playwright fallbacks) is the slow part of this, not the metadata list call(s).
+    Fetches run concurrently (bounded by max_workers, default _DEFAULT_FULL_TEXT_WORKERS) via
+    ThreadPoolExecutor, since each fetch is dominated by network wait, not CPU — this is the slow
+    part of pulling from Metacritic (the metadata list call(s) are comparatively instant), so
+    parallelizing it is what actually speeds up a real run. The returned list is in the SAME
+    ORDER as `items`, not completion order: each ReviewSource's key is built from its ORIGINAL
+    index (_make_key(i, outlet)), and callers/tests depend on that staying stable regardless of
+    which review's fetch happened to finish first.
+
+    progress_cb(done, total, outlet), if given, is called from the calling (main) thread as each
+    fetch completes — used by the Streamlit UI to drive a progress bar. Safe to wire directly to
+    Streamlit widgets since as_completed() is iterated on the caller's thread even though the
+    fetches themselves ran on worker threads (Streamlit's st.* calls aren't themselves safe to
+    call from inside a worker thread).
     """
     total = len(items)
-    sources = []
-    for i, item in enumerate(items):
+    sources: List[Optional[ReviewSource]] = [None] * total
+    done_count = 0
+
+    def _build_one(i: int, item: dict) -> Tuple[int, ReviewSource]:
         url = item.get("url")
         outlet = item.get("publicationName") or url or f"Review {i + 1}"
         score = item.get("score")  # already 0-100 scale — matches this app's convention
@@ -358,23 +387,34 @@ def _sources_from_items(
         # report's per-platform breakdown lines up with what the outlet labels already show.
         platform = item.get("_platform_name") or item.get("platform")
 
-        if not url:
-            text, error = None, "Metacritic did not provide a review URL for this entry."
-        else:
-            text, _method, error = fetch_full_text(url)
+        try:
+            if not url:
+                text, error = None, "Metacritic did not provide a review URL for this entry."
+            else:
+                text, _method, error = fetch_full_text(url)
+        except Exception as e:  # noqa: BLE001 - isolate this review, keep the batch going
+            text, error = None, str(e)
 
-        sources.append(ReviewSource(
+        return i, ReviewSource(
             key=_make_key(i, outlet), outlet=outlet, score=score, date=date, url=url,
             raw_html=None, text=text, error=error, platform=platform,
-        ))
-        if progress_cb:
-            progress_cb(i + 1, total, outlet)
+        )
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = [executor.submit(_build_one, i, item) for i, item in enumerate(items)]
+        for future in as_completed(futures):
+            i, source = future.result()
+            sources[i] = source
+            done_count += 1
+            if progress_cb:
+                progress_cb(done_count, total, source.outlet)
     return sources
 
 
 def build_sources_from_metacritic(
     slug: str, platform: Optional[str] = None,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    max_workers: int = _DEFAULT_FULL_TEXT_WORKERS,
 ) -> List[ReviewSource]:
     """
     Single-platform pipeline: fetch the review list for ONE platform (or Metacritic's default
@@ -384,11 +424,12 @@ def build_sources_from_metacritic(
     common case for a company-wide report.
     """
     items = fetch_review_list(slug, platform=platform)
-    return _sources_from_items(items, progress_cb)
+    return _sources_from_items(items, progress_cb, max_workers=max_workers)
 
 
 def build_sources_from_metacritic_all_platforms(
     slug: str, progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    max_workers: int = _DEFAULT_FULL_TEXT_WORKERS,
 ) -> List[ReviewSource]:
     """
     Consolidated pipeline: discovers every platform the game released on, pulls and merges
@@ -398,4 +439,4 @@ def build_sources_from_metacritic_all_platforms(
     platform by platform" entry point.
     """
     items = fetch_review_list_all_platforms(slug)
-    return _sources_from_items(items, progress_cb)
+    return _sources_from_items(items, progress_cb, max_workers=max_workers)
