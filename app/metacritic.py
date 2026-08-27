@@ -70,6 +70,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -158,17 +159,15 @@ def fetch_review_list(slug: str, platform: Optional[str] = None, page_size: int 
     return items
 
 
-def fetch_game_platforms(slug: str) -> List[dict]:
+def _fetch_game_item(slug: str) -> dict:
     """
-    Returns every platform this game was released on: [{"name", "slug", "review_count"}, ...].
-    Found the same way as the reviews-list API — viewing source on a Metacritic game page and
-    reading its embedded Nuxt payload, which records the "self" link for the product API call
-    that filled in the page (.../games/metacritic/<slug>/web?componentName=product&...) and the
-    "platforms" array it returns, each entry carrying its own criticScoreSummary.reviewCount
-    and platform slug (e.g. "playstation-5", "pc", "xbox-series-x").
-
-    This is what makes cross-platform consolidation possible: fetch_review_list() alone can
-    only pull one platform at a time, and doesn't know what platforms exist to loop over.
+    Shared by fetch_game_platforms() and fetch_game_info(): hits Metacritic's product API for
+    this game and returns the raw "item" payload — found the same way as the reviews-list API,
+    viewing source on a Metacritic game page and reading its embedded Nuxt payload, which records
+    the "self" link for this product API call (.../games/metacritic/<slug>/web?componentName=
+    product&...). Confirmed live against persona-3-reload: the item carries "title" (the game's
+    display name), "releaseDate" (lead-platform release, "YYYY-MM-DD"), and a "platforms" array
+    where each entry has its own "name", "slug", "releaseDate", and criticScoreSummary.reviewCount.
     """
     session = requests.Session()
     session.headers.update(_HEADERS)
@@ -176,7 +175,10 @@ def fetch_game_platforms(slug: str) -> List[dict]:
               "componentType": "Product"}
     resp = session.get(_GAME_API_URL.format(slug=slug), params=params, timeout=20)
     resp.raise_for_status()
-    item = resp.json().get("data", {}).get("item", {})
+    return resp.json().get("data", {}).get("item", {})
+
+
+def _platforms_from_item(item: dict) -> List[dict]:
     platforms = []
     for p in item.get("platforms", []):
         summary = p.get("criticScoreSummary") or {}
@@ -186,6 +188,45 @@ def fetch_game_platforms(slug: str) -> List[dict]:
             "review_count": summary.get("reviewCount") or 0,
         })
     return platforms
+
+
+def fetch_game_platforms(slug: str) -> List[dict]:
+    """
+    Returns every platform this game was released on: [{"name", "slug", "review_count"}, ...].
+    This is what makes cross-platform consolidation possible: fetch_review_list() alone can
+    only pull one platform at a time, and doesn't know what platforms exist to loop over.
+    """
+    return _platforms_from_item(_fetch_game_item(slug))
+
+
+def fetch_game_info(slug: str) -> dict:
+    """
+    Returns {"title": str|None, "release_date": date|None, "platforms": [...]} — the game's own
+    display title and lead-platform release date, plus every platform it released on (same shape
+    as fetch_game_platforms()). Used to auto-fill the Game title / Platform(s) / Release date
+    fields in the UI from just a pasted Metacritic link, instead of requiring a producer to type
+    them in by hand.
+
+    release_date is parsed from the API's "releaseDate" field (format confirmed against a live
+    response: "YYYY-MM-DD") into a real date object for st.date_input. If the API ever omits the
+    field or changes its format, this returns None for release_date (and/or title) rather than
+    raising — the caller falls back to leaving that field blank/hand-filled, same as if this
+    lookup had never been run.
+    """
+    item = _fetch_game_item(slug)
+    title = item.get("title")
+    release_date = None
+    raw_date = item.get("releaseDate")
+    if isinstance(raw_date, str) and raw_date:
+        try:
+            release_date = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            release_date = None
+    return {
+        "title": title if isinstance(title, str) and title.strip() else None,
+        "release_date": release_date,
+        "platforms": _platforms_from_item(item),
+    }
 
 
 def fetch_review_list_all_platforms(slug: str) -> List[dict]:
