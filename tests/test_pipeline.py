@@ -7,6 +7,7 @@ themselves need a live ANTHROPIC_API_KEY to test for real (see README).
 Run: pytest tests/test_pipeline.py -v
 """
 import sys
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +26,7 @@ from app.matrix import (
 )
 from app.metacritic import (
     build_sources_from_metacritic, build_sources_from_metacritic_all_platforms, fetch_full_text,
-    fetch_game_platforms, fetch_review_list, fetch_review_list_all_platforms,
+    fetch_game_info, fetch_game_platforms, fetch_review_list, fetch_review_list_all_platforms,
     parse_game_url_or_slug,
 )
 from app.narrative import _build_narrative_tool, draft_narrative
@@ -1178,6 +1179,67 @@ def test_fetch_game_platforms_parses_platform_list(monkeypatch):
         {"name": "PC", "slug": "pc", "review_count": 12},
         {"name": "Switch", "slug": "switch", "review_count": 0},
     ]
+
+
+def test_fetch_game_info_parses_title_release_date_and_platforms(monkeypatch):
+    # Real field names/shape confirmed against a live response for persona-3-reload: top-level
+    # "title" and "releaseDate" ("YYYY-MM-DD"), plus the same "platforms" array
+    # fetch_game_platforms() already reads — this powers the "Look up game info from this link"
+    # button that auto-fills the Game title / Platform(s) / Release date fields in the UI.
+    fake_json = {
+        "data": {
+            "item": {
+                "title": "Persona 3 Reload",
+                "releaseDate": "2024-02-02",
+                "platforms": [
+                    {"name": "PlayStation 5", "slug": "playstation-5",
+                     "criticScoreSummary": {"reviewCount": 45}},
+                    {"name": "Xbox Series X", "slug": "xbox-series-x",
+                     "criticScoreSummary": {"reviewCount": 36}},
+                ],
+            }
+        }
+    }
+
+    class _FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, params=None, timeout=None):
+            return _FakeReviewListResponse(fake_json)
+
+    monkeypatch.setattr(metacritic.requests, "Session", _FakeSession)
+
+    info = fetch_game_info("persona-3-reload")
+
+    assert info["title"] == "Persona 3 Reload"
+    assert info["release_date"] == date(2024, 2, 2)
+    assert info["platforms"] == [
+        {"name": "PlayStation 5", "slug": "playstation-5", "review_count": 45},
+        {"name": "Xbox Series X", "slug": "xbox-series-x", "review_count": 36},
+    ]
+
+
+def test_fetch_game_info_handles_missing_or_malformed_fields_gracefully(monkeypatch):
+    # A missing title, an unparseable release date, and no platforms at all should each degrade
+    # to None/[] rather than raising — the UI falls back to leaving those fields blank/hand-filled
+    # exactly as if this lookup had never been run, instead of crashing the whole page.
+    fake_json = {"data": {"item": {"releaseDate": "not-a-date", "platforms": []}}}
+
+    class _FakeSession:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, url, params=None, timeout=None):
+            return _FakeReviewListResponse(fake_json)
+
+    monkeypatch.setattr(metacritic.requests, "Session", _FakeSession)
+
+    info = fetch_game_info("some-slug")
+
+    assert info["title"] is None
+    assert info["release_date"] is None
+    assert info["platforms"] == []
 
 
 def test_fetch_review_list_all_platforms_dedupes_and_labels_duplicate_outlets(monkeypatch):
