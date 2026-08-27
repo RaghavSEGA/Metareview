@@ -76,6 +76,24 @@ st.caption(
     "final. Agents advise, humans decide."
 )
 
+with st.expander("How this tool works — read this first if you're new", expanded=False):
+    st.markdown(
+        "1. **Source your reviews** below — fetch from Metacritic, paste review URLs, and/or "
+        "upload saved HTML/PDF, in any combination. They all land in the same review list.\n"
+        "2. **Check the review table** that appears — fix outlet names, scores, or dates by "
+        "hand, and uncheck anything you don't want included in this run.\n"
+        "3. **Confirm the game title, platform(s), and categories** further down — Metacritic "
+        "fetch fills these in automatically, but double check them, especially the category "
+        "list (add anything specific to this title).\n"
+        "4. **Click \"Run metareview.\"** The tool classifies every included review, then shows "
+        "you any *emergent categories* — recurring topics reviewers raised that weren't on "
+        "your list — so you can edit or approve them before it scores reviews against those "
+        "too.\n"
+        "5. **Review and download** the matrix (.xlsx) and draft report (.docx). Both are a "
+        "first draft for a human to check, not a finished product — see the disclosures at "
+        "the bottom of the results."
+    )
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -103,9 +121,19 @@ with st.sidebar:
     model = classify.DEFAULT_MODEL
 
     st.divider()
-    target_reviews = st.slider("Target review count", DEFAULT_MIN_REVIEWS, MAX_REVIEWS,
-                                DEFAULT_TARGET_REVIEWS)
-    restrict_curated = st.checkbox("Restrict to Metacritic's curated critics list", value=True)
+    target_reviews = st.slider(
+        "Target review count", DEFAULT_MIN_REVIEWS, MAX_REVIEWS, DEFAULT_TARGET_REVIEWS,
+        help="A goal to source toward, shown back to you in the report's disclosures — this "
+             "doesn't cap or force anything. Fetch as many or as few reviews as you actually "
+             "find; the run works fine above or below this number.",
+    )
+    restrict_curated = st.checkbox(
+        "Restrict to Metacritic's curated critics list", value=True,
+        help="When checked, only outlets on the bundled curated-critics snapshot (see the "
+             "caption below) are included by default in the review table — anything else "
+             "still shows up but starts unchecked. Uncheck this to default every fetched or "
+             "uploaded review to included regardless of outlet.",
+    )
     curated_outlets, snapshot_date = load_bundled_curated_list()
     st.caption(f"Curated list snapshot: {snapshot_date} ({len(curated_outlets)} outlets). "
                "Re-fetch live before a real run if it's been a while — see rubric.py.")
@@ -144,68 +172,18 @@ with st.sidebar:
              "way PD Recommendations is when that toggle is off.",
     )
 
-# Applies a Metacritic game-info lookup queued by the "Look up game info from this link" button
-# in the Metacritic tab (further down this script). This MUST run before the Game title/
-# Platform(s)/Release date widgets below are created: Streamlit raises a StreamlitAPIException
-# if you write to st.session_state[key] for a widget's key after that widget has already been
-# instantiated in the current script run, so the button handler can't set mrv_game_title etc.
-# directly on the same run it fires in — it stashes the fetched values under this neutral,
-# non-widget-bound key instead and reruns; this block, running ahead of widget creation on
-# every run, is what actually applies them.
-_pending_game_info = st.session_state.pop("_mc_pending_game_info", None)
-if _pending_game_info:
-    if _pending_game_info.get("title"):
-        st.session_state["mrv_game_title"] = _pending_game_info["title"]
-    if _pending_game_info.get("platforms_text"):
-        st.session_state["mrv_platforms"] = _pending_game_info["platforms_text"]
-    if _pending_game_info.get("release_date"):
-        st.session_state["mrv_release_date"] = _pending_game_info["release_date"]
-
 # ---------------------------------------------------------------------------
-# Game metadata
+# 1. Review sourcing — kept at the top since it's the first thing every run needs, and
+#    fetching from Metacritic auto-fills the game info card further down the page (see the
+#    "Fetch reviews from Metacritic" button below) — sourcing first, confirming second.
 # ---------------------------------------------------------------------------
-st.markdown('<div class="mrv-card">', unsafe_allow_html=True)
-col1, col2, col3 = st.columns(3)
-# Explicit keys so the "Fetch from Metacritic" tab's game-info lookup can fill these in — see
-# the pending-info block above and the "Look up game info from this link" button below.
-game_title = col1.text_input("Game title", key="mrv_game_title")
-platforms = col2.text_input("Platform(s)", key="mrv_platforms")
-release_date = col3.date_input("Release date", value=None, key="mrv_release_date")
-
-st.markdown(
-    '<div style="font-size:.82rem;font-weight:600;color:#8899BB;margin-bottom:2px;">'
-    "Categories (the axes reviews are scored against)</div>", unsafe_allow_html=True,
+st.subheader("1. Source your reviews")
+st.caption(
+    "All three tabs below add to the **same** review list — mix and match freely, in any "
+    "order. A common flow: fetch from Metacritic first (it also fills in the game title, "
+    "platform(s), and release date further down this page), then use the other two tabs to "
+    "top up anything that failed to fetch, or isn't on Metacritic at all."
 )
-default_selected = st.multiselect(
-    "Standard categories — uncheck any that don't apply to this title",
-    options=DEFAULT_CATEGORIES, default=DEFAULT_CATEGORIES, label_visibility="collapsed",
-)
-custom_categories_text = st.text_area(
-    "Custom categories for this title (one per line)",
-    value="", height=90, placeholder="e.g. Recasting\nCombining Puyo Puyo and Tetris\nGacha/Monetization",
-    help="Genre- or franchise-specific axes that aren't in the standard list. These get "
-         "classified and scored exactly like the standard categories — add as many as this "
-         "title needs. The classifier can still surface further emergent categories on its own "
-         "from review text even beyond what you list here.",
-)
-custom_categories = [c.strip() for c in custom_categories_text.splitlines() if c.strip()]
-
-# Union, de-duplicated case-insensitively, defaults first then custom, preserving input order.
-categories, _seen = [], set()
-for c in default_selected + custom_categories:
-    key = c.lower()
-    if key not in _seen:
-        _seen.add(key)
-        categories.append(c)
-
-st.caption(f"{len(categories)} categor{'y' if len(categories) == 1 else 'ies'} will be scored "
-           f"this run ({len(default_selected)} standard, {len(custom_categories)} custom).")
-st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------------------------------------------------------------------
-# Review sourcing
-# ---------------------------------------------------------------------------
-st.subheader("Reviews")
 tab_metacritic, tab_urls, tab_upload = st.tabs(
     ["Fetch from Metacritic", "Paste review URLs", "Upload saved HTML (zip)"]
 )
@@ -223,53 +201,17 @@ with tab_metacritic:
         "By default this consolidates reviews across EVERY platform the game released on "
         "(not just whichever one Metacritic's own page shows first) — an outlet that reviewed "
         "both the PS5 and PC versions separately will show up as two rows, labeled by platform. "
+        "Fetching also looks up the game's title, platform list, and release date and fills "
+        "them into the card further down the page — check and adjust those after fetching. "
         "Some outlets will still fail to fetch (hard paywalls, aggressive bot-blocking) — check "
         "the error column in the review table below and fall back to the upload tab, or paste "
-        "the URL in the first tab, for any that don't come through."
+        "the URL in the next tab, for any that don't come through."
     )
     mc_input = st.text_input(
         "Metacritic game URL or slug",
         placeholder="https://www.metacritic.com/game/persona-3-reload/critic-reviews/  "
                     "(or just: persona-3-reload)",
     )
-    if st.button("Look up game info from this link") and mc_input.strip():
-        _mc_lookup_slug, _ = metacritic.parse_game_url_or_slug(mc_input)
-        try:
-            _game_info = metacritic.fetch_game_info(_mc_lookup_slug)
-        except Exception as e:  # noqa: BLE001 - surface a clear error, don't crash the app
-            st.error(f"Couldn't look up game info: {e}")
-        else:
-            # Can't write mrv_game_title/mrv_platforms/mrv_release_date directly here — those
-            # widgets were already created earlier in THIS run (the card sits above the tabs),
-            # and Streamlit forbids setting a widget-bound session_state key after that widget
-            # has run. Queue the values under a neutral key instead; the pending-info block near
-            # the top of the script applies them on the rerun below, before those widgets exist
-            # for that run.
-            _filled = []
-            _pending = {}
-            if _game_info["title"]:
-                _pending["title"] = _game_info["title"]
-                _filled.append("title")
-            if _game_info["platforms"]:
-                # Also seeds mc_platforms (below) so the "restrict to one platform" picker has
-                # its options ready without a second, separate lookup click. Not widget-bound,
-                # so this one's safe to set directly.
-                _pending["platforms_text"] = ", ".join(
-                    p["name"] for p in _game_info["platforms"] if p.get("name")
-                )
-                st.session_state["mc_platforms"] = _game_info["platforms"]
-                _filled.append("platform(s)")
-            if _game_info["release_date"]:
-                _pending["release_date"] = _game_info["release_date"]
-                _filled.append("release date")
-            if _filled:
-                st.session_state["_mc_pending_game_info"] = _pending
-                st.success(f"Filled in {', '.join(_filled)} from Metacritic — check the card "
-                           "at the top of the page and adjust if needed.")
-            else:
-                st.warning("Metacritic didn't return usable title/platform/release-date data "
-                           "for this link — fill those in by hand.")
-            st.rerun()
     restrict_platform = st.checkbox(
         "Restrict to one platform instead of consolidating all",
         value=False,
@@ -304,8 +246,37 @@ with tab_metacritic:
             if mc_platform_from_url:
                 mc_platform_slug = mc_platform_from_url
 
-    if st.button("Fetch reviews from Metacritic") and mc_input.strip():
+    if st.button("Fetch reviews from Metacritic", type="primary") and mc_input.strip():
         mc_slug, mc_platform_from_url = metacritic.parse_game_url_or_slug(mc_input)
+
+        # Always looks up the game's title/platforms/release date as part of this same click —
+        # there used to be a separate "Look up game info from this link" button, but there was
+        # never a real reason to fetch reviews from a game without also wanting its basic info
+        # filled in, so the two are just one action now. Writing directly to the mrv_* keys is
+        # safe here (unlike the old separate button, which had to queue the values and rerun)
+        # because this code runs, in script order, BEFORE the Game title/Platform(s)/Release
+        # date widgets are created further down this page — Streamlit only forbids writing to a
+        # widget's session_state key AFTER that widget has already been instantiated in the
+        # current run.
+        game_info_filled = []
+        try:
+            game_info = metacritic.fetch_game_info(mc_slug)
+        except Exception:  # noqa: BLE001 - best-effort; never block the review fetch over this
+            game_info = None
+        if game_info:
+            if game_info.get("title"):
+                st.session_state["mrv_game_title"] = game_info["title"]
+                game_info_filled.append("title")
+            if game_info.get("platforms"):
+                st.session_state["mrv_platforms"] = ", ".join(
+                    p["name"] for p in game_info["platforms"] if p.get("name")
+                )
+                st.session_state["mc_platforms"] = game_info["platforms"]
+                game_info_filled.append("platform(s)")
+            if game_info.get("release_date"):
+                st.session_state["mrv_release_date"] = game_info["release_date"]
+                game_info_filled.append("release date")
+
         progress = st.progress(0.0, text="Fetching review list from Metacritic...")
 
         def _mc_progress_cb(done, total, outlet):
@@ -332,7 +303,12 @@ with tab_metacritic:
                 if restrict_platform and effective_platform
                 else " (all platforms)"
             )
-            st.success(f"Added {len(new_sources)} review(s) from Metacritic{label}.")
+            info_note = (
+                f" Also filled in {', '.join(game_info_filled)} below — check and adjust if needed."
+                if game_info_filled else
+                " Couldn't auto-fill the game info card below this time — fill it in by hand."
+            )
+            st.success(f"Added {len(new_sources)} review(s) from Metacritic{label}.{info_note}")
             if failed:
                 st.warning(
                     f"{len(failed)} of {len(new_sources)} full review texts failed to fetch "
@@ -341,6 +317,11 @@ with tab_metacritic:
                 )
 
 with tab_urls:
+    st.caption(
+        "Adds individually-pasted review URLs to the same review list as the Metacritic tab — "
+        "use this to top up outlets Metacritic's fetch missed, or to source reviews for a game "
+        "that isn't on Metacritic at all. One URL per line."
+    )
     urls_text = st.text_area("One review URL per line", height=150)
     if st.button("Fetch these URLs"):
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
@@ -361,11 +342,12 @@ with tab_urls:
 
 with tab_upload:
     st.caption(
-        "Zip of .html/.htm files saved from a browser (Ctrl+S / Save Page As) and/or .pdf files "
-        "(e.g. printed/saved review pages or scanned clippings), any mix — optionally with a "
-        "manifest.csv (columns: filename, outlet, score, date, url). Use this for outlets that "
-        "block automated fetching, paywalled reviews, or non-English outlets. A scanned PDF with "
-        "no selectable text won't extract — flag it as an error in the review table below. "
+        "Also adds to the same review list as the other two tabs. Zip of .html/.htm files "
+        "saved from a browser (Ctrl+S / Save Page As) and/or .pdf files (e.g. printed/saved "
+        "review pages or scanned clippings), any mix — optionally with a manifest.csv "
+        "(columns: filename, outlet, score, date, url). Use this for outlets that block "
+        "automated fetching, paywalled reviews, or non-English outlets. A scanned PDF with no "
+        "selectable text won't extract — flag it as an error in the review table below. "
         "You don't need to fill in Score by hand: it's auto-detected from the review text "
         "itself when possible (an explicit manifest value always wins), and the Score column "
         "stays editable either way. Reviews in other languages are handled too — the classifier "
@@ -424,14 +406,68 @@ if st.session_state["sources"]:
         st.warning(f"Only {included_count} reviews included — below the {DEFAULT_MIN_REVIEWS} "
                    "minimum guideline. Results will carry a small-sample caveat.")
 
-    # -----------------------------------------------------------------------
-    # Run
-    # -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 2. Game metadata + categories
+# ---------------------------------------------------------------------------
+st.subheader("2. Confirm game info & categories")
+st.markdown('<div class="mrv-card">', unsafe_allow_html=True)
+st.caption(
+    "Fetching from Metacritic above fills these in automatically — check them over and adjust "
+    "by hand if needed (e.g. a game with no Metacritic listing, or a title Metacritic got wrong)."
+)
+col1, col2, col3 = st.columns(3)
+# Explicit keys so the "Fetch reviews from Metacritic" button above can fill these in directly —
+# safe because that button's handler runs earlier in the script than these widgets are created.
+game_title = col1.text_input("Game title", key="mrv_game_title")
+platforms = col2.text_input("Platform(s)", key="mrv_platforms")
+release_date = col3.date_input("Release date", value=None, key="mrv_release_date")
+
+st.markdown(
+    '<div style="font-size:.82rem;font-weight:600;color:#8899BB;margin-bottom:2px;">'
+    "Categories (the axes reviews are scored against)</div>", unsafe_allow_html=True,
+)
+default_selected = st.multiselect(
+    "Standard categories — uncheck any that don't apply to this title",
+    options=DEFAULT_CATEGORIES, default=DEFAULT_CATEGORIES, label_visibility="collapsed",
+)
+custom_categories_text = st.text_area(
+    "Custom categories for this title (one per line)",
+    value="", height=90, placeholder="e.g. Recasting\nCombining Puyo Puyo and Tetris\nGacha/Monetization",
+    help="Genre- or franchise-specific axes that aren't in the standard list. These get "
+         "classified and scored exactly like the standard categories — add as many as this "
+         "title needs. The classifier can still surface further emergent categories on its own "
+         "from review text even beyond what you list here — you'll get a chance to review and "
+         "edit those before they're scored, right before the second pass runs.",
+)
+custom_categories = [c.strip() for c in custom_categories_text.splitlines() if c.strip()]
+
+# Union, de-duplicated case-insensitively, defaults first then custom, preserving input order.
+categories, _seen = [], set()
+for c in default_selected + custom_categories:
+    key = c.lower()
+    if key not in _seen:
+        _seen.add(key)
+        categories.append(c)
+
+st.caption(f"{len(categories)} categor{'y' if len(categories) == 1 else 'ies'} will be scored "
+           f"this run ({len(default_selected)} standard, {len(custom_categories)} custom). "
+           "Every one of these will get at least a short write-up in the report, even one "
+           "mentioned by only a handful of reviews — thinly-discussed categories are flagged "
+           "with a low-sample caveat rather than left out.")
+st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Run — stage 1: classify against the known category list and detect emergent categories.
+# Stops there and hands off to the confirmation block below rather than immediately running a
+# second classification pass against whatever categories it happened to detect — a producer
+# should see and, if needed, edit that list before more classification calls are spent on it.
+# ---------------------------------------------------------------------------
+if st.session_state["sources"]:
     # A disabled st.button gives no visible reason why — spell it out explicitly rather than
     # leaving the producer to guess which precondition they're missing.
     disabled_reasons = []
     if not game_title:
-        disabled_reasons.append('enter a **Game title** above (in the card at the top of the page)')
+        disabled_reasons.append("enter a **Game title** above")
     if not categories:
         disabled_reasons.append("select or add at least one **category** above")
     if included_count == 0:
@@ -508,15 +544,68 @@ if st.session_state["sources"]:
                       "See the warning above for per-review errors, fix or drop those, and re-run.")
             st.stop()
 
-        emergent = classify.detect_emergent_categories(client, all_candidates, len(active_sources),
-                                                         model=model)
-        full_categories = categories + [c for c in emergent if c not in categories]
+        emergent_detected = classify.detect_emergent_categories(
+            client, all_candidates, len(active_sources), model=model
+        )
+
+        # Hands off to the confirmation block below rather than immediately scoring against
+        # whatever got detected — stash everything the second pass needs under a neutral
+        # session_state key and rerun so that block renders.
+        st.session_state["_stage1"] = {
+            "active_sources": active_sources, "data": data, "categories": categories,
+            "emergent_detected": emergent_detected, "non_english": non_english,
+            "llm_filled_scores": llm_filled_scores,
+        }
+        st.session_state["run_stage"] = "awaiting_emergent_review"
+        st.session_state.pop("result", None)  # clear any stale prior result while we re-run
+        st.rerun()
+
+# ---------------------------------------------------------------------------
+# Run — stage 2: show the producer what emergent categories were detected (if any), let them
+# edit the list, then classify against it and compute final scores. Kept as a separate block
+# from stage 1 above (rather than one continuous run) so a producer can see and correct this
+# list BEFORE more classification calls are spent scoring reviews against it.
+# ---------------------------------------------------------------------------
+if st.session_state.get("run_stage") == "awaiting_emergent_review":
+    stage1 = st.session_state["_stage1"]
+    st.divider()
+    st.subheader("3. Confirm emergent categories")
+    emergent_detected = stage1["emergent_detected"]
+    if emergent_detected:
+        st.write(
+            "Beyond your standard/custom category list, reviewers repeatedly raised these "
+            "topics with a clear opinion. Continuing runs a second classification pass that "
+            "actually **scores** every included review against whichever categories are listed "
+            "below (not just names them) — edit the list first if you want to drop, rename, or "
+            "add anything, then continue."
+        )
+    else:
+        st.write(
+            "No recurring off-list topic came up often enough this run to become an emergent "
+            "category. Add any below if you'd like a second pass to score reviews against "
+            "something extra, or just continue with none."
+        )
+    emergent_text = st.text_area(
+        "Emergent categories (one per line)",
+        value="\n".join(emergent_detected), height=120,
+    )
+    edited_emergent = [c.strip() for c in emergent_text.splitlines() if c.strip()]
+
+    col_continue, col_cancel = st.columns(2)
+    if col_continue.button("Continue with these categories", type="primary"):
+        active_sources = stage1["active_sources"]
+        data = stage1["data"]
+        base_categories = stage1["categories"]
+        non_english = stage1["non_english"]
+        llm_filled_scores = stage1["llm_filled_scores"]
+
+        full_categories = base_categories + [c for c in edited_emergent if c not in base_categories]
 
         emergent_failed = []
-        if emergent:
-            # Emergent categories are only just NAMED at this point — no review has actually
-            # been asked about them yet (they weren't known to exist during the classification
-            # pass above). Without this second pass, every emergent category would carry real
+        if edited_emergent:
+            # These categories are only just NAMED at this point — no review has actually been
+            # asked about them yet (they weren't known to exist during the classification pass
+            # in stage 1). Without this second pass, every emergent category would carry real
             # names into the matrix with zero classifications behind them — not "no reviews
             # mentioned this" but "no review was ever asked" — which renders as a flat,
             # misleading 0 across every stat instead of real data. See
@@ -528,7 +617,7 @@ if st.session_state["sources"]:
                                     text=f"Scored {done}/{total} against emergent categories")
 
             emergent_data, emergent_failed = classify.classify_reviews_for_categories(
-                client, active_sources, emergent, model=model, max_workers=parallel_workers,
+                client, active_sources, edited_emergent, model=model, max_workers=parallel_workers,
                 progress_cb=_emergent_progress_cb
             )
             for cat, entries in emergent_data.items():
@@ -537,7 +626,7 @@ if st.session_state["sources"]:
                 st.warning(
                     f"{len(emergent_failed)} of {len(active_sources)} review(s) failed to score "
                     "against the emergent categories specifically (their standard-category "
-                    "scores from the main pass above are unaffected): "
+                    "scores from the main pass are unaffected): "
                     + ", ".join(f"{outlet} ({err})" for outlet, err in emergent_failed)
                 )
 
@@ -553,9 +642,15 @@ if st.session_state["sources"]:
 
         st.session_state["result"] = {
             "reviews": review_dicts, "categories": full_categories, "data": data,
-            "scores": scores, "emergent": emergent, "non_english": non_english,
+            "scores": scores, "emergent": edited_emergent, "non_english": non_english,
             "llm_filled_scores": llm_filled_scores, "avg_score": avg_score,
         }
+        st.session_state.pop("_stage1", None)
+        st.session_state.pop("run_stage", None)
+        st.rerun()
+    if col_cancel.button("Cancel this run"):
+        st.session_state.pop("_stage1", None)
+        st.session_state.pop("run_stage", None)
         st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -566,11 +661,15 @@ if "result" in st.session_state:
     st.divider()
     st.header("Results")
 
-    reportable = {k: v for k, v in res["scores"].items() if v["meets_threshold"]}
-    below = {k: v for k, v in res["scores"].items() if not v["meets_threshold"]}
+    low_mention = {k: v for k, v in res["scores"].items() if not v["meets_threshold"]}
 
+    # Every category is plotted, not just ones with plenty of mentions — a low-mention category
+    # still has real (if thin) data behind it, and hiding it entirely made it impossible to
+    # tell "not discussed" apart from "excluded for being under-discussed." A "*" on the label
+    # marks it instead, matching the same convention in the downloaded xlsx/docx graphs.
     chart_df = pd.DataFrame([
-        {"category": k, "weighted": v["weighted"]} for k, v in reportable.items()
+        {"category": (f"{k} *" if not v["meets_threshold"] else k), "weighted": v["weighted"]}
+        for k, v in res["scores"].items()
     ]).sort_values("weighted")
     if not chart_df.empty:
         fig = px.bar(chart_df, x="weighted", y="category", orientation="h",
@@ -583,15 +682,19 @@ if "result" in st.session_state:
     st.dataframe(pd.DataFrame([
         {"category": k, "weighted": round(v["weighted"], 2), "positive": v["positive"],
          "mixed": v["mixed"], "negative": v["negative"],
-         "mention_rate": f"{v['mention_rate']:.0%}"}
+         "mention_rate": f"{v['mention_rate']:.0%}",
+         "low_mention": not v["meets_threshold"]}
         for k, v in res["scores"].items()
     ]), use_container_width=True)
 
-    if below:
-        st.caption(f"Below the {INCLUSION_THRESHOLD:.0%} reporting threshold this run: "
-                   + ", ".join(below.keys()))
+    if low_mention:
+        st.caption(
+            f"* Mentioned by fewer than {INCLUSION_THRESHOLD:.0%} of reviews — still scored and "
+            "reported below, just worth reading with a bit more caution given the small sample: "
+            + ", ".join(low_mention.keys())
+        )
     if res["emergent"]:
-        st.success(f"Emergent categories detected: {', '.join(res['emergent'])}")
+        st.success(f"Emergent categories scored this run: {', '.join(res['emergent'])}")
     if res.get("avg_score") is None:
         st.warning(
             "No review in this batch had a detectable numeric score — Average Score will show "
@@ -620,8 +723,12 @@ if "result" in st.session_state:
         f"{len(res['reviews'])} reviews used (target was {target_reviews}; "
         f"{DEFAULT_MIN_REVIEWS} minimum per Sega's existing guidance).",
         "Sourced via direct outlet fetch and/or producer-uploaded saved pages — see run inputs.",
-        f"Categories below the {INCLUSION_THRESHOLD:.0%} mention threshold were excluded from "
-        f"scoring: {', '.join(below.keys()) if below else 'none'}.",
+        (
+            f"Every selected/custom/emergent category is scored and reported below, including "
+            f"ones mentioned by fewer than {INCLUSION_THRESHOLD:.0%} of reviews — those are "
+            "flagged as low-sample in the chart, matrix, and report rather than excluded: "
+            + (', '.join(low_mention.keys()) if low_mention else 'none this run') + "."
+        ),
         "Scores were taken from a manifest.csv, a producer's hand-edit in the review table, an "
         "auto-detected numeric score found in the review text itself (e.g. '8.5/10', '90%'), or "
         f"— for {res.get('llm_filled_scores', 0)} review(s) this run — the classifying model's "
@@ -644,10 +751,11 @@ if "result" in st.session_state:
     if res.get("emergent"):
         disclosures.append(
             f"{len(res['emergent'])} emergent categor{'y' if len(res['emergent']) == 1 else 'ies'} "
-            f"detected from recurring themes reviewers raised that weren't on the standard/"
-            f"custom category list: {', '.join(res['emergent'])}. Every included review was "
-            "classified a second time against just these categories, so they carry real scored "
-            "data in the matrix (not just a name)."
+            f"were detected from recurring themes reviewers raised that weren't on the standard/"
+            f"custom category list, shown to the producer for review, and confirmed (with edits, "
+            f"if any) before this second pass ran: {', '.join(res['emergent'])}. Every included "
+            "review was classified a second time against just these categories, so they carry "
+            "real scored data in the matrix (not just a name)."
         )
 
     with st.spinner("Drafting narrative sections..."):
@@ -668,6 +776,7 @@ if "result" in st.session_state:
         review_count=len(res["reviews"]), average_score=res["avg_score"],
         disclosures=disclosures,
         platform_breakdown=platform_breakdown,
+        category_scores=res["scores"],
     )
 
     with st.expander("Drafted narrative (preview before download)"):
