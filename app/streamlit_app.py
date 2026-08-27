@@ -111,6 +111,17 @@ with st.sidebar:
                "Re-fetch live before a real run if it's been a while — see rubric.py.")
 
     st.divider()
+    parallel_workers = st.slider(
+        "Parallel requests", min_value=1, max_value=10, value=5,
+        help="How many reviews to fetch or classify at once instead of strictly one at a time — "
+             "applies to the Metacritic full-text fetch and to both classification passes. "
+             "Higher is faster on a large batch but raises the chance of tripping the LLM API's "
+             "rate limit, and (Metacritic tab only) can spike memory if several reviews fall "
+             "back to a concurrent headless-browser render at once. Set to 1 to go back to "
+             "strictly sequential.",
+    )
+
+    st.divider()
     include_recommendations = st.checkbox(
         "Include \"PD Recommendations for Next Title\" section", value=True,
         help="Uncheck to leave this section out of the report entirely for this run — e.g. if "
@@ -287,11 +298,12 @@ with tab_metacritic:
             if restrict_platform:
                 effective_platform = mc_platform_slug or mc_platform_from_url
                 new_sources = metacritic.build_sources_from_metacritic(
-                    mc_slug, platform=effective_platform, progress_cb=_mc_progress_cb
+                    mc_slug, platform=effective_platform, progress_cb=_mc_progress_cb,
+                    max_workers=parallel_workers,
                 )
             else:
                 new_sources = metacritic.build_sources_from_metacritic_all_platforms(
-                    mc_slug, progress_cb=_mc_progress_cb
+                    mc_slug, progress_cb=_mc_progress_cb, max_workers=parallel_workers,
                 )
         except Exception as e:  # noqa: BLE001 - surface a clear error, don't crash the app
             st.error(f"Couldn't fetch the review list from Metacritic: {e}")
@@ -389,28 +401,39 @@ if st.session_state["sources"]:
         non_english = {}  # outlet -> language, for the translated-quotes disclosure below
         llm_filled_scores = 0  # scores backfilled from the model, not the manifest/regex/hand-edit
         progress = st.progress(0.0, text="Classifying reviews...")
-        for i, s in enumerate(active_sources):
-            try:
-                result = classify.classify_review(client, s.text, categories, model=model)
-                for c in result["classifications"]:
-                    data.setdefault(c["category"], {})[s.key] = (c["value"], c["quote"])
-                all_candidates.extend(result.get("candidate_emergent_topics", []))
 
-                # Score: the table's existing value (manifest, upload-time regex extraction, or
-                # a producer's hand-edit) always wins — the LLM only fills in what's still None.
-                if s.score is None and result.get("stated_score") is not None:
-                    s.score = result["stated_score"]
-                    llm_filled_scores += 1
+        def _classify_progress_cb(done, total):
+            progress.progress(done / max(total, 1), text=f"Classified {done}/{total}")
 
-                # Language: every classification quote above was already translated to English
-                # per the classification prompt — this just records which reviews needed it.
-                s.language = result.get("review_language") or "Unknown"
-                if s.language.lower() not in ("english", "unknown"):
-                    non_english[s.outlet] = s.language
-            except Exception as e:  # noqa: BLE001 - isolate this review, keep the batch going
+        # Classified concurrently (bounded by the "Parallel requests" sidebar slider) — see
+        # classify.classify_reviews()'s docstring. Its result list is guaranteed to line up
+        # positionally with active_sources regardless of which review's API call actually
+        # finished first, so the zip() below is safe.
+        classify_results = classify.classify_reviews(
+            client, active_sources, categories, model=model,
+            max_workers=parallel_workers, progress_cb=_classify_progress_cb,
+        )
+        for s, result in zip(active_sources, classify_results):
+            if result is None or "error" in result:
+                err = result["error"] if result else "no result returned"
                 failed_keys.add(s.key)
-                failed_sources.append((s.outlet, str(e)))
-            progress.progress((i + 1) / len(active_sources), text=f"Classified {i+1}/{len(active_sources)}")
+                failed_sources.append((s.outlet, err))
+                continue
+            for c in result["classifications"]:
+                data.setdefault(c["category"], {})[s.key] = (c["value"], c["quote"])
+            all_candidates.extend(result.get("candidate_emergent_topics", []))
+
+            # Score: the table's existing value (manifest, upload-time regex extraction, or a
+            # producer's hand-edit) always wins — the LLM only fills in what's still None.
+            if s.score is None and result.get("stated_score") is not None:
+                s.score = result["stated_score"]
+                llm_filled_scores += 1
+
+            # Language: every classification quote above was already translated to English per
+            # the classification prompt — this just records which reviews needed it.
+            s.language = result.get("review_language") or "Unknown"
+            if s.language.lower() not in ("english", "unknown"):
+                non_english[s.outlet] = s.language
 
         if failed_sources:
             st.warning(
@@ -448,7 +471,8 @@ if st.session_state["sources"]:
                                     text=f"Scored {done}/{total} against emergent categories")
 
             emergent_data, emergent_failed = classify.classify_reviews_for_categories(
-                client, active_sources, emergent, model=model, progress_cb=_emergent_progress_cb
+                client, active_sources, emergent, model=model, max_workers=parallel_workers,
+                progress_cb=_emergent_progress_cb
             )
             for cat, entries in emergent_data.items():
                 data.setdefault(cat, {}).update(entries)
