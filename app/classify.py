@@ -15,6 +15,7 @@ The matrix/report-building plumbing is exercised without any live credentials in
 tests/test_pipeline.py by calling classify_review/detect_emergent_categories with a hand-built
 fake `client`; get_client() itself needs real secrets and is not covered by that suite.
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional
 
 import streamlit as st
@@ -28,6 +29,14 @@ except ImportError:
 from .rubric import CLASSIFICATION_SYSTEM_PROMPT, INCLUSION_THRESHOLD
 
 DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6"  # Bedrock model ID; see get_client()
+
+# Bounded concurrency for classify_reviews() below: these calls are network-I/O-bound (waiting
+# on the Anthropic/Bedrock API), not CPU-bound, so a ThreadPoolExecutor is effective despite the
+# GIL — threads spend nearly all their time blocked on I/O, not contending for the interpreter
+# lock. Deliberately NOT unbounded ("one thread per review"): a large batch firing dozens of
+# simultaneous requests risks tripping Anthropic/Bedrock's per-minute rate limit. 5 is a
+# reasonable default; streamlit_app.py exposes this as a sidebar slider so a producer can tune it.
+DEFAULT_MAX_WORKERS = 5
 
 def _build_classify_tool(categories: List[str]) -> dict:
     """
@@ -239,15 +248,62 @@ def classify_review(client, review_text: str, categories: List[str],
     raise RuntimeError("Model did not return a submit_classification tool call")
 
 
+def classify_reviews(client, sources, categories: List[str], model: str = DEFAULT_MODEL,
+                      max_workers: int = DEFAULT_MAX_WORKERS,
+                      progress_cb: Optional[Callable[[int, int], None]] = None) -> List[dict]:
+    """
+    Classifies every item in `sources` against `categories` concurrently (bounded by
+    max_workers workers), returning one result dict per source in the SAME ORDER as `sources` —
+    not completion order. Order matters here: callers (e.g. metacritic._make_key, and the main
+    classification loop in streamlit_app.py) key results back to sources by position, so a
+    caller must be able to zip(sources, classify_reviews(...)) and get the right pairing
+    regardless of which review's API call actually finished first.
+
+    Each entry is either classify_review()'s normal result dict, or {"error": str} if that
+    specific review's classification call raised — isolated per-review, same principle used
+    throughout this app: one bad review's failure doesn't sink the whole batch.
+
+    Concurrency is via ThreadPoolExecutor rather than multiprocessing or plain asyncio: these
+    calls are network-I/O-bound (waiting on the Anthropic/Bedrock API), not CPU-bound, so threads
+    spend nearly all their time blocked rather than contending for the GIL — see DEFAULT_MAX_WORKERS
+    above for why concurrency is bounded rather than "one thread per review."
+
+    progress_cb(done, total), if given, is called from the calling (main) thread as each result
+    completes — as_completed() is iterated on the caller's thread even though the futures
+    themselves ran on worker threads, so this is safe to wire directly to Streamlit progress
+    widgets, which are not themselves safe to call from inside a worker thread.
+    """
+    results: List[Optional[dict]] = [None] * len(sources)
+    done_count = 0
+
+    def _run(i, s):
+        return i, classify_review(client, s.text, categories, model=model)
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = {executor.submit(_run, i, s): i for i, s in enumerate(sources)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                _, result = future.result()
+            except Exception as e:  # noqa: BLE001 - isolate this review, keep the batch going
+                result = {"error": str(e)}
+            results[i] = result
+            done_count += 1
+            if progress_cb:
+                progress_cb(done_count, len(sources))
+    return results
+
+
 def classify_reviews_for_categories(client, sources, categories: List[str],
                                      model: str = DEFAULT_MODEL,
+                                     max_workers: int = DEFAULT_MAX_WORKERS,
                                      progress_cb: Optional[Callable[[int, int], None]] = None):
     """
-    Classifies every item in `sources` against `categories` and merges the results into a single
-    {category: {review_key: (value, quote)}} dict — the same shape streamlit_app.py's main
-    classification loop builds by hand around classify_review(), factored out here so it can
-    also drive the follow-up pass that scores reviews against EMERGENT categories once
-    detect_emergent_categories() has named them.
+    Classifies every item in `sources` against `categories` (concurrently, via classify_reviews()
+    above) and merges the results into a single {category: {review_key: (value, quote)}} dict —
+    the same shape streamlit_app.py's main classification loop used to build by hand around
+    classify_review(), factored out here so it can also drive the follow-up pass that scores
+    reviews against EMERGENT categories once detect_emergent_categories() has named them.
 
     That follow-up pass is necessary, not optional: emergent categories aren't known until every
     review has already been classified once (detect_emergent_categories clusters candidate
@@ -266,20 +322,23 @@ def classify_reviews_for_categories(client, sources, categories: List[str],
     loop: one bad review's failure here doesn't sink the whole batch, and doesn't affect that
     review's already-scored standard-category classifications either).
 
-    progress_cb(done, total), if given, is called after each review — same shape as the
-    progress callbacks already used elsewhere in this app (e.g. metacritic.py).
+    progress_cb(done, total), if given, is called after each review completes — same shape as
+    the progress callbacks already used elsewhere in this app (e.g. metacritic.py). max_workers=1
+    makes this fully sequential/deterministic — used by a couple of tests whose fakes assume a
+    fixed call order; real callers should leave it at the default.
     """
+    results = classify_reviews(client, sources, categories, model=model,
+                                max_workers=max_workers, progress_cb=progress_cb)
     data = {}
     failed = []
-    for i, s in enumerate(sources):
-        try:
-            result = classify_review(client, s.text, categories, model=model)
-            for c in result["classifications"]:
-                data.setdefault(c["category"], {})[s.key] = (c["value"], c["quote"])
-        except Exception as e:  # noqa: BLE001 - isolate this review, keep the batch going
-            failed.append((s.outlet, str(e)))
-        if progress_cb:
-            progress_cb(i + 1, len(sources))
+    for s, result in zip(sources, results):
+        if result is None:
+            continue
+        if "error" in result:
+            failed.append((s.outlet, result["error"]))
+            continue
+        for c in result["classifications"]:
+            data.setdefault(c["category"], {})[s.key] = (c["value"], c["quote"])
     return data, failed
 
 
