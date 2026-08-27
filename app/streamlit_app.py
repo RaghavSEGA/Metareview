@@ -144,14 +144,30 @@ with st.sidebar:
              "way PD Recommendations is when that toggle is off.",
     )
 
+# Applies a Metacritic game-info lookup queued by the "Look up game info from this link" button
+# in the Metacritic tab (further down this script). This MUST run before the Game title/
+# Platform(s)/Release date widgets below are created: Streamlit raises a StreamlitAPIException
+# if you write to st.session_state[key] for a widget's key after that widget has already been
+# instantiated in the current script run, so the button handler can't set mrv_game_title etc.
+# directly on the same run it fires in — it stashes the fetched values under this neutral,
+# non-widget-bound key instead and reruns; this block, running ahead of widget creation on
+# every run, is what actually applies them.
+_pending_game_info = st.session_state.pop("_mc_pending_game_info", None)
+if _pending_game_info:
+    if _pending_game_info.get("title"):
+        st.session_state["mrv_game_title"] = _pending_game_info["title"]
+    if _pending_game_info.get("platforms_text"):
+        st.session_state["mrv_platforms"] = _pending_game_info["platforms_text"]
+    if _pending_game_info.get("release_date"):
+        st.session_state["mrv_release_date"] = _pending_game_info["release_date"]
+
 # ---------------------------------------------------------------------------
 # Game metadata
 # ---------------------------------------------------------------------------
 st.markdown('<div class="mrv-card">', unsafe_allow_html=True)
 col1, col2, col3 = st.columns(3)
-# Explicit keys so the "Fetch from Metacritic" tab's game-info lookup can fill these in
-# programmatically (by writing to st.session_state[key] before this widget is created on the
-# next rerun) — see the "Look up game info from this link" button below.
+# Explicit keys so the "Fetch from Metacritic" tab's game-info lookup can fill these in — see
+# the pending-info block above and the "Look up game info from this link" button below.
 game_title = col1.text_input("Game title", key="mrv_game_title")
 platforms = col2.text_input("Platform(s)", key="mrv_platforms")
 release_date = col3.date_input("Release date", value=None, key="mrv_release_date")
@@ -223,22 +239,31 @@ with tab_metacritic:
         except Exception as e:  # noqa: BLE001 - surface a clear error, don't crash the app
             st.error(f"Couldn't look up game info: {e}")
         else:
+            # Can't write mrv_game_title/mrv_platforms/mrv_release_date directly here — those
+            # widgets were already created earlier in THIS run (the card sits above the tabs),
+            # and Streamlit forbids setting a widget-bound session_state key after that widget
+            # has run. Queue the values under a neutral key instead; the pending-info block near
+            # the top of the script applies them on the rerun below, before those widgets exist
+            # for that run.
             _filled = []
+            _pending = {}
             if _game_info["title"]:
-                st.session_state["mrv_game_title"] = _game_info["title"]
+                _pending["title"] = _game_info["title"]
                 _filled.append("title")
             if _game_info["platforms"]:
                 # Also seeds mc_platforms (below) so the "restrict to one platform" picker has
-                # its options ready without a second, separate lookup click.
-                st.session_state["mrv_platforms"] = ", ".join(
+                # its options ready without a second, separate lookup click. Not widget-bound,
+                # so this one's safe to set directly.
+                _pending["platforms_text"] = ", ".join(
                     p["name"] for p in _game_info["platforms"] if p.get("name")
                 )
                 st.session_state["mc_platforms"] = _game_info["platforms"]
                 _filled.append("platform(s)")
             if _game_info["release_date"]:
-                st.session_state["mrv_release_date"] = _game_info["release_date"]
+                _pending["release_date"] = _game_info["release_date"]
                 _filled.append("release date")
             if _filled:
+                st.session_state["_mc_pending_game_info"] = _pending
                 st.success(f"Filled in {', '.join(_filled)} from Metacritic — check the card "
                            "at the top of the page and adjust if needed.")
             else:
