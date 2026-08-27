@@ -7,13 +7,16 @@ from io import BytesIO
 from typing import Optional
 
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from .charts import render_opinion_graph_png
 
 
 def build_report_docx(game_title: str, methodology_note: str, narrative: dict,
                        review_count: int, average_score: Optional[float],
-                       disclosures: list, platform_breakdown: Optional[dict] = None) -> bytes:
+                       disclosures: list, platform_breakdown: Optional[dict] = None,
+                       category_scores: Optional[dict] = None) -> bytes:
     """
     narrative: the dict returned by narrative.draft_narrative() — executive_summary (str),
     press_reactions_synthesis (list[str]), category_callouts (list of {category, label,
@@ -24,6 +27,11 @@ def build_report_docx(game_title: str, methodology_note: str, narrative: dict,
     as extra lines under Review Averages only when 2+ distinct platforms are represented (a
     single-platform run just gets the existing blended Review count / Average score line, same
     as the real Persona 3: Reload reference report, which shows no platform breakdown at all).
+    category_scores: output of matrix.compute_weighted_scores(), or None — when given, renders
+    the Opinion Graph as a picture directly in the "Metareview Matrix" section (matching the
+    real Puyo Puyo Tetris reference report, which embeds this same graph at the same spot) via
+    charts.render_opinion_graph_png(). None/omitted skips the picture entirely (report still
+    builds fine — every existing caller that doesn't pass this keeps working unchanged).
     """
     doc = Document()
     doc.styles["Normal"].font.name = "Calibri"
@@ -37,9 +45,10 @@ def build_report_docx(game_title: str, methodology_note: str, narrative: dict,
         "A critique is defined as a statement of positivity or negativity towards an aspect "
         "of the game. A reviewer who makes both a positive and a negative statement about the "
         "same aspect receives a neutral rating. A reviewer who only mentions a feature without "
-        "opinion is not counted. Categories are only reported when at least 25% of the sample "
-        "commented on them. This metareview only covers press/critic reviews, which differs "
-        "from user/fan feedback."
+        "opinion is not counted. Every category is reported below regardless of how many "
+        "reviews commented on it; a category commented on by fewer than 25% of the sample is "
+        "marked as a low-sample caveat rather than left out. This metareview only covers "
+        "press/critic reviews, which differs from user/fan feedback."
     )
 
     doc.add_heading("Executive Summary", level=1)
@@ -113,7 +122,12 @@ def build_report_docx(game_title: str, methodology_note: str, narrative: dict,
 
     doc.add_heading("Metareview Matrix", level=1)
     doc.add_paragraph("See the attached matrix workbook (Summary tab) for the full category "
-                       "breakdown, formulas, and opinion graph.")
+                       "breakdown and underlying formulas.")
+
+    opinion_graph_png = render_opinion_graph_png(game_title, category_scores) if category_scores else None
+    if opinion_graph_png:
+        doc.add_heading("Opinion Graph", level=2)
+        doc.add_picture(BytesIO(opinion_graph_png), width=Inches(6.5))
 
     doc.add_heading("Notes on this AI-assisted run", level=1)
     for d in disclosures:
