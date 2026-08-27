@@ -14,6 +14,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app import metacritic
+from app.charts import render_opinion_graph_png
 from app.classify import (
     _normalize_classifications, _normalize_review_language, _normalize_stated_score,
     classify_review, classify_reviews, classify_reviews_for_categories,
@@ -488,6 +489,35 @@ def test_suggest_sentiment_label_matches_reference_reports():
     assert suggest_sentiment_label(0, 0, 0) == "Not enough data"
 
 
+def test_render_opinion_graph_png_plots_every_category_including_low_mention():
+    # A low-mention category is still plotted (just marked with a "*" in its label) rather than
+    # dropped from the picture entirely — see charts.py's render_opinion_graph_png docstring for
+    # why hiding it was more confusing than useful.
+    scores = {
+        "Combat": {"weighted": 0.5, "meets_threshold": True},
+        "Story": {"weighted": -0.2, "meets_threshold": True},
+        "Rarely Mentioned": {"weighted": 1.0, "meets_threshold": False},
+    }
+    png_bytes = render_opinion_graph_png("Test Game", scores)
+    assert png_bytes is not None
+    assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"  # real PNG signature, not empty/garbage bytes
+
+
+def test_render_opinion_graph_png_plots_a_single_low_mention_category_too():
+    # Even when EVERY given category is low-mention, it's still plotted — the threshold no
+    # longer gates what's plottable at all, only whether a label gets a "*" caveat marker.
+    scores = {"Rarely Mentioned": {"weighted": 1.0, "meets_threshold": False}}
+    png_bytes = render_opinion_graph_png("Test Game", scores)
+    assert png_bytes is not None
+    assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_render_opinion_graph_png_returns_none_for_empty_scores():
+    # Nothing at all to plot — callers (matrix.py, report.py) should skip the picture/section
+    # entirely rather than embed a blank chart.
+    assert render_opinion_graph_png("Test Game", {}) is None
+
+
 def test_build_matrix_workbook_has_formulas_not_hardcoded_values():
     reviews, categories, data = _sample_reviews_and_data()
     wb = build_matrix_workbook("Test Game", reviews, categories, data)
@@ -495,6 +525,42 @@ def test_build_matrix_workbook_has_formulas_not_hardcoded_values():
     assert ws["A1"].value == "Test Game — Metareview"
     assert str(ws["A7"].value).startswith("=")  # weighted-score formula, not a literal number
     assert str(ws["E2"].value).startswith("=COUNTA")
+
+
+def test_build_matrix_workbook_embeds_opinion_graph_as_picture_not_native_chart():
+    # Regression guard for a real reported bug: the previous native openpyxl BarChart rendered
+    # with blank category-axis labels (an empty, oddly-rotated placeholder box per label) in a
+    # non-Excel viewer, even though it displayed correctly in Excel desktop — see charts.py's
+    # module docstring. The fix replaces that chart object with a rendered picture, which looks
+    # identical in every viewer since there's no second renderer left to disagree with
+    # matplotlib. This confirms the picture is actually embedded and the native chart is gone.
+    reviews, categories, data = _sample_reviews_and_data()
+    wb = build_matrix_workbook("Test Game", reviews, categories, data)
+    ws = wb["Summary"]
+    assert len(ws._images) == 1  # the rendered Opinion Graph picture
+    assert not ws._charts  # no native chart object left to render incorrectly elsewhere
+
+
+def test_build_matrix_workbook_cell_comments_hold_the_full_quote_and_a_sized_box():
+    # Regression guard: openpyxl's Comment box defaults to a small fixed 144x79px size, which
+    # clips a long quote's VISIBLE box (even though the underlying .content text was never
+    # actually truncated) unless it's resized — see matrix.py's _comment_box_size docstring.
+    long_quote = (
+        "This is a deliberately long pull-quote meant to exceed the default openpyxl comment "
+        "box size so we can confirm the box is sized up rather than the quote being clipped, "
+        "since a producer should be able to read the whole thing without dragging the box "
+        "bigger by hand in Excel every single time they open the workbook."
+    )
+    reviews = [{"key": "a", "outlet": "Outlet A", "score": 90, "date": "2024-01-01"}]
+    categories = ["Combat"]
+    data = {"Combat": {"a": (1, long_quote)}}
+    wb = build_matrix_workbook("Test Game", reviews, categories, data)
+    ws = wb["Summary"]
+    cell = ws.cell(row=7, column=6)  # FIRST_REVIEW_COL, first category row
+    assert cell.comment is not None
+    assert cell.comment.content == long_quote  # never truncated
+    assert cell.comment.height > 79  # bigger than openpyxl's small default box
+    assert cell.comment.width > 144
 
 
 def test_build_matrix_workbook_review_count_and_weighted_formula_use_outlet_row_not_score_row():
@@ -598,9 +664,43 @@ def test_draft_narrative_does_not_retry_when_result_already_populated():
     assert len(client.messages.calls) == 1  # no wasted retry call
 
 
+def test_draft_narrative_backfills_categories_still_missing_after_retry():
+    # Even after the one retry, the model may still skip a category (e.g. a very large run) —
+    # draft_narrative must inject an honest, minimal fallback entry for anything still missing
+    # rather than silently shipping a report where a scored category has no write-up at all.
+    category_scores = {
+        "Combat": {"meets_threshold": True, "weighted": 0.6, "positive": 20, "mixed": 2,
+                   "negative": 1, "mention_rate": 0.9, "suggested_label": "Widely Praised"},
+        "Rarely Mentioned": {"meets_threshold": False, "weighted": 1.0, "positive": 1,
+                              "mixed": 0, "negative": 0, "mention_rate": 0.05,
+                              "suggested_label": "Not enough data"},
+    }
+    # Neither call ever mentions "Rarely Mentioned" — simulates the model dropping a category
+    # even after the retry, at double budget.
+    response_missing_one = {
+        "executive_summary": "Well received overall.",
+        "press_reactions_synthesis": ["Reviewers praised the combat."],
+        "category_callouts": [{"category": "Combat", "label": "Widely Praised",
+                                "label_caveat": "", "synthesis": "Praised.",
+                                "quotes": [{"text": "great combat", "outlet": "Outlet A"}]}],
+        "recommendations": [{"heading": "Keep it up", "text": "Maintain combat quality."}],
+    }
+    client = _QueuedClient([dict(response_missing_one), dict(response_missing_one)])
+    result = draft_narrative(client, "Test Game", "PS5", 85.0, 35, category_scores, {}, [],
+                              model="test-model", max_tokens=4000)
+
+    assert len(client.messages.calls) == 2  # retried once, then gave up and backfilled
+    callout_categories = {co["category"] for co in result["category_callouts"]}
+    assert callout_categories == {"Combat", "Rarely Mentioned"}  # nothing dropped
+
+    backfilled = next(co for co in result["category_callouts"] if co["category"] == "Rarely Mentioned")
+    assert backfilled["quotes"] == []
+    assert "small" in backfilled["label_caveat"].lower() or "caution" in backfilled["label_caveat"].lower()
+
+
 def test_build_narrative_tool_omits_recommendations_property_when_disabled():
-    tool_with = _build_narrative_tool(True)
-    tool_without = _build_narrative_tool(False)
+    tool_with = _build_narrative_tool(["Combat"], True)
+    tool_without = _build_narrative_tool(["Combat"], False)
 
     assert "recommendations" in tool_with["input_schema"]["properties"]
     assert "recommendations" in tool_with["input_schema"]["required"]
@@ -637,8 +737,8 @@ def test_draft_narrative_forces_empty_recommendations_and_does_not_retry_spuriou
 
 
 def test_build_narrative_tool_omits_fan_reaction_property_by_default():
-    tool_default = _build_narrative_tool(True)  # include_fan_reaction defaults to False
-    tool_with = _build_narrative_tool(True, include_fan_reaction=True)
+    tool_default = _build_narrative_tool(["Combat"], True)  # include_fan_reaction defaults to False
+    tool_with = _build_narrative_tool(["Combat"], True, include_fan_reaction=True)
 
     assert "fan_reaction" not in tool_default["input_schema"]["properties"]
     assert "fan_reaction" in tool_with["input_schema"]["properties"]
@@ -757,6 +857,50 @@ def test_build_report_docx_produces_nonempty_bytes():
     )
     assert len(docx_bytes) > 1000  # a real docx, not an empty/broken file
     assert docx_bytes[:2] == b"PK"  # docx is a zip archive
+
+
+def test_build_report_docx_embeds_opinion_graph_picture_when_category_scores_given():
+    # Matches the real Puyo Puyo Tetris reference report, which embeds the Opinion Graph
+    # directly in the "Metareview Matrix" section rather than only pointing to the attached
+    # xlsx — this is the feature that closes that gap.
+    from docx import Document
+    from io import BytesIO
+
+    reviews, categories, data = _sample_reviews_and_data()
+    scores = compute_weighted_scores(reviews, categories, data)
+    narrative = {
+        "executive_summary": "Summary.", "press_reactions_synthesis": [],
+        "category_callouts": [], "recommendations": [],
+    }
+    docx_bytes = build_report_docx(
+        game_title="Test Game", methodology_note="note", narrative=narrative,
+        review_count=4, average_score=83.75, disclosures=["test"],
+        category_scores=scores,
+    )
+    doc = Document(BytesIO(docx_bytes))
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "Opinion Graph" in full_text
+    assert len(doc.inline_shapes) == 1  # the embedded picture, not a native chart object
+
+
+def test_build_report_docx_omits_opinion_graph_when_no_category_scores_given():
+    # Every existing caller/test that doesn't pass category_scores must keep working exactly
+    # as before this feature — no picture, no "Opinion Graph" heading, no crash.
+    from docx import Document
+    from io import BytesIO
+
+    narrative = {
+        "executive_summary": "Summary.", "press_reactions_synthesis": [],
+        "category_callouts": [], "recommendations": [],
+    }
+    docx_bytes = build_report_docx(
+        game_title="Test Game", methodology_note="note", narrative=narrative,
+        review_count=4, average_score=83.75, disclosures=["test"],
+    )
+    doc = Document(BytesIO(docx_bytes))
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert "Opinion Graph" not in full_text
+    assert len(doc.inline_shapes) == 0
 
 
 def test_build_report_docx_renders_platform_breakdown_only_with_two_or_more_platforms():
