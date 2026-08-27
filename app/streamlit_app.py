@@ -149,9 +149,12 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 st.markdown('<div class="mrv-card">', unsafe_allow_html=True)
 col1, col2, col3 = st.columns(3)
-game_title = col1.text_input("Game title")
-platforms = col2.text_input("Platform(s)")
-release_date = col3.date_input("Release date")
+# Explicit keys so the "Fetch from Metacritic" tab's game-info lookup can fill these in
+# programmatically (by writing to st.session_state[key] before this widget is created on the
+# next rerun) — see the "Look up game info from this link" button below.
+game_title = col1.text_input("Game title", key="mrv_game_title")
+platforms = col2.text_input("Platform(s)", key="mrv_platforms")
+release_date = col3.date_input("Release date", value=None, key="mrv_release_date")
 
 st.markdown(
     '<div style="font-size:.82rem;font-weight:600;color:#8899BB;margin-bottom:2px;">'
@@ -187,52 +190,12 @@ st.markdown("</div>", unsafe_allow_html=True)
 # Review sourcing
 # ---------------------------------------------------------------------------
 st.subheader("Reviews")
-tab_urls, tab_upload, tab_metacritic = st.tabs(
-    ["Paste review URLs", "Upload saved HTML (zip)", "Fetch from Metacritic"]
+tab_metacritic, tab_urls, tab_upload = st.tabs(
+    ["Fetch from Metacritic", "Paste review URLs", "Upload saved HTML (zip)"]
 )
 
 if "sources" not in st.session_state:
     st.session_state["sources"] = []
-
-with tab_urls:
-    urls_text = st.text_area("One review URL per line", height=150)
-    if st.button("Fetch these URLs"):
-        urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
-        fetched = []
-        progress = st.progress(0.0)
-        for i, u in enumerate(urls):
-            src = fetch_review_url(lambda url: requests.get(url, timeout=20).text,
-                                    u, key=f"url_{i}", outlet_hint=u)
-            fetched.append(src)
-            progress.progress((i + 1) / max(len(urls), 1))
-        st.session_state["sources"].extend(fetched)
-        failed = [s for s in fetched if s.error]
-        if failed:
-            st.warning(
-                f"{len(failed)} of {len(urls)} URLs failed to fetch (blocked/paywalled/etc). "
-                "Use the upload tab for those, or leave them out and note the gap in the report."
-            )
-
-with tab_upload:
-    st.caption(
-        "Zip of .html/.htm files saved from a browser (Ctrl+S / Save Page As) and/or .pdf files "
-        "(e.g. printed/saved review pages or scanned clippings), any mix — optionally with a "
-        "manifest.csv (columns: filename, outlet, score, date, url). Use this for outlets that "
-        "block automated fetching, paywalled reviews, or non-English outlets. A scanned PDF with "
-        "no selectable text won't extract — flag it as an error in the review table below. "
-        "You don't need to fill in Score by hand: it's auto-detected from the review text "
-        "itself when possible (an explicit manifest value always wins), and the Score column "
-        "stays editable either way. Reviews in other languages are handled too — the classifier "
-        "reads and scores them natively and translates quotes to English for the report; see "
-        "the Language column and the run's disclosures for which reviews that applied to."
-    )
-    zip_file = st.file_uploader("Reviews zip", type=["zip"])
-    manifest_file = st.file_uploader("Manifest CSV (optional)", type=["csv"])
-    if st.button("Add uploaded reviews") and zip_file:
-        new_sources = parse_uploaded_zip(
-            zip_file.read(), manifest_file.read() if manifest_file else None
-        )
-        st.session_state["sources"].extend(new_sources)
 
 with tab_metacritic:
     st.caption(
@@ -253,6 +216,35 @@ with tab_metacritic:
         placeholder="https://www.metacritic.com/game/persona-3-reload/critic-reviews/  "
                     "(or just: persona-3-reload)",
     )
+    if st.button("Look up game info from this link") and mc_input.strip():
+        _mc_lookup_slug, _ = metacritic.parse_game_url_or_slug(mc_input)
+        try:
+            _game_info = metacritic.fetch_game_info(_mc_lookup_slug)
+        except Exception as e:  # noqa: BLE001 - surface a clear error, don't crash the app
+            st.error(f"Couldn't look up game info: {e}")
+        else:
+            _filled = []
+            if _game_info["title"]:
+                st.session_state["mrv_game_title"] = _game_info["title"]
+                _filled.append("title")
+            if _game_info["platforms"]:
+                # Also seeds mc_platforms (below) so the "restrict to one platform" picker has
+                # its options ready without a second, separate lookup click.
+                st.session_state["mrv_platforms"] = ", ".join(
+                    p["name"] for p in _game_info["platforms"] if p.get("name")
+                )
+                st.session_state["mc_platforms"] = _game_info["platforms"]
+                _filled.append("platform(s)")
+            if _game_info["release_date"]:
+                st.session_state["mrv_release_date"] = _game_info["release_date"]
+                _filled.append("release date")
+            if _filled:
+                st.success(f"Filled in {', '.join(_filled)} from Metacritic — check the card "
+                           "at the top of the page and adjust if needed.")
+            else:
+                st.warning("Metacritic didn't return usable title/platform/release-date data "
+                           "for this link — fill those in by hand.")
+            st.rerun()
     restrict_platform = st.checkbox(
         "Restrict to one platform instead of consolidating all",
         value=False,
@@ -322,6 +314,46 @@ with tab_metacritic:
                     "(blocked/JS-only/paywalled) — see the error column in the review table "
                     "below. Use the upload tab for those outlets instead."
                 )
+
+with tab_urls:
+    urls_text = st.text_area("One review URL per line", height=150)
+    if st.button("Fetch these URLs"):
+        urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
+        fetched = []
+        progress = st.progress(0.0)
+        for i, u in enumerate(urls):
+            src = fetch_review_url(lambda url: requests.get(url, timeout=20).text,
+                                    u, key=f"url_{i}", outlet_hint=u)
+            fetched.append(src)
+            progress.progress((i + 1) / max(len(urls), 1))
+        st.session_state["sources"].extend(fetched)
+        failed = [s for s in fetched if s.error]
+        if failed:
+            st.warning(
+                f"{len(failed)} of {len(urls)} URLs failed to fetch (blocked/paywalled/etc). "
+                "Use the upload tab for those, or leave them out and note the gap in the report."
+            )
+
+with tab_upload:
+    st.caption(
+        "Zip of .html/.htm files saved from a browser (Ctrl+S / Save Page As) and/or .pdf files "
+        "(e.g. printed/saved review pages or scanned clippings), any mix — optionally with a "
+        "manifest.csv (columns: filename, outlet, score, date, url). Use this for outlets that "
+        "block automated fetching, paywalled reviews, or non-English outlets. A scanned PDF with "
+        "no selectable text won't extract — flag it as an error in the review table below. "
+        "You don't need to fill in Score by hand: it's auto-detected from the review text "
+        "itself when possible (an explicit manifest value always wins), and the Score column "
+        "stays editable either way. Reviews in other languages are handled too — the classifier "
+        "reads and scores them natively and translates quotes to English for the report; see "
+        "the Language column and the run's disclosures for which reviews that applied to."
+    )
+    zip_file = st.file_uploader("Reviews zip", type=["zip"])
+    manifest_file = st.file_uploader("Manifest CSV (optional)", type=["csv"])
+    if st.button("Add uploaded reviews") and zip_file:
+        new_sources = parse_uploaded_zip(
+            zip_file.read(), manifest_file.read() if manifest_file else None
+        )
+        st.session_state["sources"].extend(new_sources)
 
 # ---------------------------------------------------------------------------
 # Review table — fill in/confirm outlet, score, date; drop anything unwanted
